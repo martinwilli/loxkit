@@ -5,11 +5,18 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
+aes = "0.9"
 anyhow = "1.0.103"
+base64 = "0.22"
+block-padding = "0.4"
+cbc = { version = "0.2", features = ["alloc", "block-padding"] }
 clap = { version = "4.6.1", features = ["derive"] }
 futures-util = "0.3.32"
+rand = "0.8"
+rsa = "0.9"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+sha2 = "0.11"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 tokio-tungstenite = "0.30"

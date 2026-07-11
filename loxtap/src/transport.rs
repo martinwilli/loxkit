@@ -131,7 +131,10 @@ pub struct LlBody {
 
 impl LlResponse {
     /// Parse an `LL` envelope from a text-frame reply.
-    fn parse(text: &str) -> Result<Self, TransportError> {
+    ///
+    /// Public so the crypto layer can re-parse the plaintext it recovers from a
+    /// `fenc` reply, whose decrypted body is itself a full `LL` envelope.
+    pub fn parse(text: &str) -> Result<Self, TransportError> {
         Ok(serde_json::from_str(text)?)
     }
 
