@@ -15,7 +15,7 @@ use tracing::info;
 use super::Sink;
 use crate::model::{LoxUuid, Reading, SeriesMeta};
 
-/// A sink that logs each reading as `name [room/category] = value unit`.
+/// A sink that logs each reading as `[category/room] name = value unit`.
 #[derive(Default)]
 pub struct DebugSink {
     /// Labels learned via `upsert_meta`, joined into the log line by uuid.
@@ -51,7 +51,7 @@ impl Sink for DebugSink {
 /// Format one reading for the log, joining in its labels when known.
 ///
 /// A pure function so the wording is testable without capturing log output:
-/// `name [room/category] = value unit`, degrading gracefully as labels are
+/// `[category/room] name = value unit`, degrading gracefully as labels are
 /// missing (no brackets without a room or category, no unit suffix without a
 /// unit, the bare uuid as the name when nothing is cached).
 ///
@@ -66,16 +66,16 @@ fn format_reading(meta: Option<&SeriesMeta>, reading: &Reading) -> String {
         None => reading.uuid.to_lox_string(),
     };
     let location = match meta.map(|m| (m.room.as_deref(), m.category.as_deref())) {
-        Some((Some(room), Some(cat))) => format!(" [{room}/{cat}]"),
-        Some((Some(room), None)) => format!(" [{room}]"),
-        Some((None, Some(cat))) => format!(" [{cat}]"),
+        Some((Some(room), Some(cat))) => format!("[{cat}/{room}] "),
+        Some((Some(room), None)) => format!("[{room}] "),
+        Some((None, Some(cat))) => format!("[{cat}] "),
         _ => String::new(),
     };
     let unit = match meta.and_then(|m| m.unit.as_deref()) {
         Some(unit) => format!(" {unit}"),
         None => String::new(),
     };
-    format!("{name}{location} = {}{unit}", reading.value)
+    format!("{location}{name} = {}{unit}", reading.value)
 }
 
 #[cfg(test)]
@@ -119,7 +119,7 @@ mod tests {
         let r = reading("deadbeef-2222-0000-0000000000000001", 21.5);
         assert_eq!(
             format_reading(Some(&m), &r),
-            "Temperature [Room A/Category X] = 21.5 °C"
+            "[Category X/Room A] Temperature = 21.5 °C"
         );
     }
 
@@ -138,7 +138,7 @@ mod tests {
         let r = reading("deadbeef-2222-0000-0000000000000020", 14.37);
         assert_eq!(
             format_reading(Some(&m), &r),
-            "Energiemonitor/prodCurr [Technik/Strom] = 14.37"
+            "[Strom/Technik] Energiemonitor/prodCurr = 14.37"
         );
 
         // A sub equal to the name (a flat globalState) adds nothing, so drop it.
@@ -166,7 +166,7 @@ mod tests {
             None,
         );
         let r = reading("deadbeef-2222-0000-0000000000000010", 42.0);
-        assert_eq!(format_reading(Some(&m), &r), "Meter [Room A] = 42");
+        assert_eq!(format_reading(Some(&m), &r), "[Room A] Meter = 42");
 
         // No labels at all: fall back to the uuid string, no brackets, no unit.
         let r = reading("deadbeef-2222-0000-0000000000000099", 7.0);
@@ -195,7 +195,7 @@ mod tests {
             let labels = sink.labels.read().unwrap();
             assert_eq!(
                 format_reading(labels.get(&r.uuid), &r),
-                "Temperature [Room A/Category X] = 21.5 °C"
+                "[Category X/Room A] Temperature = 21.5 °C"
             );
         }
         sink.write(std::slice::from_ref(&r)).await.unwrap();
