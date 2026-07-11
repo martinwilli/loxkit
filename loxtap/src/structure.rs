@@ -111,6 +111,7 @@ impl Structure {
             name: e.name.clone(),
             room: e.room.clone(),
             category: e.category.clone(),
+            sub: e.sub.clone(),
             unit: e.unit.clone(),
         })
     }
@@ -491,12 +492,13 @@ mod tests {
     }
 
     #[test]
-    fn series_meta_drops_the_sub_and_keeps_labels() {
+    fn series_meta_carries_the_sub_and_labels() {
         let structure = Structure::parse(FIXTURE).unwrap();
         let id = uuid("deadbeef-2222-0000-0000000000000001");
         let meta = structure.series_meta(&id).unwrap();
         assert_eq!(meta.uuid, id);
         assert_eq!(meta.name, "Temperature");
+        assert_eq!(meta.sub, "value");
         assert_eq!(meta.room.as_deref(), Some("Room A"));
         assert_eq!(meta.unit.as_deref(), Some("°C"));
         assert!(structure.series_meta(&uuid("00000000-0000-0000-0000000000000000")).is_none());

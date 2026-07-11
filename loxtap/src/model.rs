@@ -125,6 +125,11 @@ pub struct SeriesMeta {
     pub name: String,
     pub room: Option<String>,
     pub category: Option<String>,
+    /// The state name this uuid was published under (e.g. `prodCurr`). Unlike
+    /// the other fields it is a stable protocol name, not a mutable label; it is
+    /// carried so a sink can tell apart co-located states of one control, which
+    /// otherwise share name, room and category.
+    pub sub: String,
     pub unit: Option<String>,
 }
 

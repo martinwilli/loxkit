@@ -54,11 +54,17 @@ impl Sink for DebugSink {
 /// `name [room/category] = value unit`, degrading gracefully as labels are
 /// missing (no brackets without a room or category, no unit suffix without a
 /// unit, the bare uuid as the name when nothing is cached).
+///
+/// Co-located states of one control share a name, room and category, so the
+/// state name (`sub`) is appended as `name/sub` to tell them apart. It is
+/// dropped when it adds nothing: the trivial `value` sub, or a sub equal to the
+/// name (the flat globalStates entries).
 fn format_reading(meta: Option<&SeriesMeta>, reading: &Reading) -> String {
-    let name = meta.map_or_else(
-        || reading.uuid.to_lox_string(),
-        |m| m.name.clone(),
-    );
+    let name = match meta {
+        Some(m) if m.sub != "value" && m.sub != m.name => format!("{}/{}", m.name, m.sub),
+        Some(m) => m.name.clone(),
+        None => reading.uuid.to_lox_string(),
+    };
     let location = match meta.map(|m| (m.room.as_deref(), m.category.as_deref())) {
         Some((Some(room), Some(cat))) => format!(" [{room}/{cat}]"),
         Some((Some(room), None)) => format!(" [{room}]"),
@@ -86,22 +92,26 @@ mod tests {
         }
     }
 
-    fn meta(uuid: &str, name: &str, room: Option<&str>, cat: Option<&str>, unit: Option<&str>) -> SeriesMeta {
+    fn meta(uuid: &str, name: &str, sub: &str, room: Option<&str>, cat: Option<&str>, unit: Option<&str>) -> SeriesMeta {
         SeriesMeta {
             uuid: uuid.parse().unwrap(),
             control: "InfoOnlyAnalog".to_owned(),
             name: name.to_owned(),
             room: room.map(str::to_owned),
             category: cat.map(str::to_owned),
+            sub: sub.to_owned(),
             unit: unit.map(str::to_owned),
         }
     }
 
     #[test]
     fn formats_fully_labeled_reading() {
+        // The trivial "value" sub is dropped, so a single-state control renders
+        // under its bare name.
         let m = meta(
             "deadbeef-2222-0000-0000000000000001",
             "Temperature",
+            "value",
             Some("Room A"),
             Some("Category X"),
             Some("°C"),
@@ -114,11 +124,43 @@ mod tests {
     }
 
     #[test]
+    fn appends_sub_to_tell_co_located_states_apart() {
+        // Two states of one control share name/room/category; the non-"value"
+        // sub distinguishes them as `name/sub`.
+        let m = meta(
+            "deadbeef-2222-0000-0000000000000020",
+            "Energiemonitor",
+            "prodCurr",
+            Some("Technik"),
+            Some("Strom"),
+            None,
+        );
+        let r = reading("deadbeef-2222-0000-0000000000000020", 14.37);
+        assert_eq!(
+            format_reading(Some(&m), &r),
+            "Energiemonitor/prodCurr [Technik/Strom] = 14.37"
+        );
+
+        // A sub equal to the name (a flat globalState) adds nothing, so drop it.
+        let g = meta(
+            "deadbeef-9999-0000-0000000000000001",
+            "hasInternet",
+            "hasInternet",
+            None,
+            None,
+            None,
+        );
+        let r = reading("deadbeef-9999-0000-0000000000000001", 1.0);
+        assert_eq!(format_reading(Some(&g), &r), "hasInternet = 1");
+    }
+
+    #[test]
     fn formats_partial_and_missing_labels() {
         // Room only, no category, no unit.
         let m = meta(
             "deadbeef-2222-0000-0000000000000010",
             "Meter",
+            "value",
             Some("Room A"),
             None,
             None,
@@ -140,6 +182,7 @@ mod tests {
         let m = meta(
             "deadbeef-2222-0000-0000000000000001",
             "Temperature",
+            "value",
             Some("Room A"),
             Some("Category X"),
             Some("°C"),
