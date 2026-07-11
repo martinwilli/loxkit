@@ -12,6 +12,11 @@
 //! on the wire, so all of them are inverted; the walk also recurses into a
 //! control's `subControls`, which inherit their parent's room and category.
 //!
+//! Not every wire uuid lives under a control: the top-level `globalStates`
+//! block (`hasInternet`, `sunrise`, ...) publishes uuids too. It carries no
+//! owning control, room or category, so it is folded in flat, keyed on the
+//! state name as the label.
+//!
 //! Freshness is cheap to check: `jdev/sps/LoxAPPversion3` returns the same
 //! `lastModified` stamp the structure file carries, so the (large) file is only
 //! re-fetched when that stamp changes.
@@ -82,6 +87,11 @@ impl Structure {
         for control in raw.controls.values() {
             index_control(&mut index, control, &raw.rooms, &raw.cats, None, None);
         }
+        // The value stream also carries uuids that live outside `controls{}`:
+        // the top-level `globalStates` block. It has no owning control, room
+        // or category, so fold it in flat with the state name as the label
+        // instead of leaving it bare on the wire.
+        index_flat_states(&mut index, &raw.global_states, "GlobalState");
         Ok(Self {
             last_modified: raw.last_modified,
             index,
@@ -193,6 +203,10 @@ struct RawStructure {
     cats: HashMap<String, RawNamed>,
     #[serde(default)]
     controls: HashMap<String, RawControl>,
+    /// Predefined system states keyed by a fixed name (e.g. `hasInternet`),
+    /// each a uuid string or an array of them. Not under any control.
+    #[serde(rename = "globalStates", default)]
+    global_states: HashMap<String, Value>,
 }
 
 /// A room or category: we only need its name.
@@ -283,6 +297,36 @@ fn index_control(
     }
 }
 
+/// Invert a flat `name -> uuid | [uuid]` state map into the index.
+///
+/// `globalStates` has no owning control, room or category, so the state name
+/// doubles as the human label. `control` is a synthetic type tag
+/// ("GlobalState") that keeps these apart from real controls downstream.
+/// Unexpected value shapes are skipped, matching [`index_control`].
+fn index_flat_states(
+    out: &mut HashMap<LoxUuid, StateEntry>,
+    states: &HashMap<String, Value>,
+    control: &str,
+) {
+    for (name, value) in states {
+        for uuid_str in state_uuids(value) {
+            if let Ok(uuid) = uuid_str.parse::<LoxUuid>() {
+                out.insert(
+                    uuid,
+                    StateEntry {
+                        control: control.to_owned(),
+                        name: name.clone(),
+                        room: None,
+                        category: None,
+                        sub: name.clone(),
+                        unit: None,
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// The uuid strings a single state value carries: one string, or an array of
 /// them. Any other shape yields nothing.
 fn state_uuids(value: &Value) -> Vec<&str> {
@@ -325,9 +369,10 @@ mod tests {
     use super::*;
 
     // A synthetic structure file with invented rooms, categories and uuids —
-    // never a capture of a real Miniserver. It exercises the three tricky
-    // shapes: a single-uuid state, an array-valued state, and a nested
-    // subcontrol that inherits its parent's room and category.
+    // never a capture of a real Miniserver. It exercises the tricky shapes: a
+    // single-uuid state, an array-valued state, a nested subcontrol that
+    // inherits its parent's room and category, plus the flat `globalStates`
+    // block that lives outside `controls{}`.
     const FIXTURE: &str = r#"{
       "lastModified": "2026-01-02 03:04:05",
       "rooms": {
@@ -335,6 +380,10 @@ mod tests {
       },
       "cats": {
         "deadbeef-0000-0000-0000000000000002": { "name": "Category X", "type": "undefined" }
+      },
+      "globalStates": {
+        "hasInternet": "deadbeef-9999-0000-0000000000000001",
+        "sunrise": "deadbeef-9999-0000-0000000000000002"
       },
       "controls": {
         "deadbeef-1111-0000-0000000000000001": {
@@ -378,8 +427,24 @@ mod tests {
     fn parses_stamp_and_all_state_uuids() {
         let structure = Structure::parse(FIXTURE).unwrap();
         assert_eq!(structure.last_modified(), "2026-01-02 03:04:05");
-        // One single-value state, two array outputs, one subcontrol state.
-        assert_eq!(structure.len(), 4);
+        // Four control states (one single-value, two array outputs, one
+        // subcontrol) plus two globalStates.
+        assert_eq!(structure.len(), 6);
+    }
+
+    #[test]
+    fn folds_global_states_flat() {
+        let structure = Structure::parse(FIXTURE).unwrap();
+        let entry = structure
+            .resolve(&uuid("deadbeef-9999-0000-0000000000000001"))
+            .unwrap();
+        // The state name doubles as the label; no owning control, room or cat.
+        assert_eq!(entry.name, "hasInternet");
+        assert_eq!(entry.control, "GlobalState");
+        assert_eq!(entry.sub, "hasInternet");
+        assert_eq!(entry.room, None);
+        assert_eq!(entry.category, None);
+        assert_eq!(entry.unit, None);
     }
 
     #[test]
