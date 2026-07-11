@@ -156,7 +156,10 @@ pub async fn run_events(
 }
 
 /// Send `enablebinstatusupdate` and require a 200 before streaming.
-async fn enable_updates(transport: &mut Transport) -> Result<(), EventError> {
+///
+/// `pub(crate)` so the supervisor can enable the stream before entering its own
+/// keepalive/refresh-aware read loop instead of [`run_events`].
+pub(crate) async fn enable_updates(transport: &mut Transport) -> Result<(), EventError> {
     let resp = transport.command(CMD_ENABLE_UPDATES).await?;
     if resp.code() != 200 {
         return Err(EventError::Enable(resp.code()));
@@ -169,8 +172,9 @@ async fn enable_updates(transport: &mut Transport) -> Result<(), EventError> {
 ///
 /// A sink failure is logged and swallowed: it must not tear down the event loop
 /// (reconnecting would not fix a storage error), so it never becomes an
-/// [`EventError`].
-async fn handle_table(
+/// [`EventError`]. `pub(crate)` so the supervisor's read loop reuses the exact
+/// same per-frame dispatch as [`run_events`].
+pub(crate) async fn handle_table(
     msg_type: MessageType,
     payload: &[u8],
     structure: &Structure,
