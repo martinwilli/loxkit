@@ -1,0 +1,203 @@
+//! Daemon configuration, parsed from a YAML file.
+//!
+//! The struct mirrors the connection parameters and operational knobs the
+//! daemon needs. Secrets (the password) never appear in the [`fmt::Debug`]
+//! output so that logging the whole config stays safe.
+
+use std::fmt;
+use std::path::Path;
+
+use anyhow::Context as _;
+use serde::Deserialize;
+
+/// Which sink resolved readings are written to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SinkKind {
+    /// Log each resolved reading via `tracing`; the only sink in Milestone 1.
+    #[default]
+    Debug,
+}
+
+/// Reconnect and keepalive timing.
+///
+/// All fields have defaults so a minimal config need not mention them.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ReconnectConfig {
+    /// First backoff delay after a drop, in seconds; doubles up to the max.
+    #[serde(default = "default_backoff_base_secs")]
+    pub backoff_base_secs: u64,
+    /// Ceiling for the exponential backoff, in seconds.
+    #[serde(default = "default_backoff_max_secs")]
+    pub backoff_max_secs: u64,
+    /// Keepalive cadence in seconds; must stay under the server idle cutoff.
+    #[serde(default = "default_keepalive_secs")]
+    pub keepalive_secs: u64,
+}
+
+impl Default for ReconnectConfig {
+    fn default() -> Self {
+        Self {
+            backoff_base_secs: default_backoff_base_secs(),
+            backoff_max_secs: default_backoff_max_secs(),
+            keepalive_secs: default_keepalive_secs(),
+        }
+    }
+}
+
+/// The full daemon configuration.
+#[derive(Clone, Deserialize)]
+pub struct Config {
+    /// Miniserver hostname or IP.
+    pub host: String,
+    /// Miniserver port (carries no default field on the wire, so we require it).
+    #[serde(default = "default_port")]
+    pub port: u16,
+    /// Login user.
+    pub user: String,
+    /// Login password.
+    pub password: String,
+    /// SHA-256 pin of the server's public key as `sha256:<hex>`.
+    ///
+    /// Present here from the start, but only *enforced* by the crypto
+    /// handshake in a later commit.
+    pub server_key_pin: String,
+    /// Stable client id under which the server tracks tokens we were issued.
+    pub token_uuid: String,
+    /// Human-readable client description sent alongside a token request.
+    pub info: String,
+    /// Which sink to write into.
+    #[serde(default)]
+    pub sink: SinkKind,
+    /// Fallback log level when `RUST_LOG` is unset.
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    /// Reconnect and keepalive knobs.
+    #[serde(default)]
+    pub reconnect: ReconnectConfig,
+}
+
+impl Config {
+    /// Parse a config from a YAML string.
+    pub fn from_yaml_str(yaml: &str) -> anyhow::Result<Self> {
+        yaml_serde::from_str(yaml).context("parsing YAML configuration")
+    }
+
+    /// Load and parse a config from a file path.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading config file {}", path.display()))?;
+        Self::from_yaml_str(&text)
+    }
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("server_key_pin", &self.server_key_pin)
+            .field("token_uuid", &self.token_uuid)
+            .field("info", &self.info)
+            .field("sink", &self.sink)
+            .field("log_level", &self.log_level)
+            .field("reconnect", &self.reconnect)
+            .finish()
+    }
+}
+
+fn default_port() -> u16 {
+    80
+}
+
+fn default_log_level() -> String {
+    "info".to_owned()
+}
+
+fn default_backoff_base_secs() -> u64 {
+    2
+}
+
+fn default_backoff_max_secs() -> u64 {
+    300
+}
+
+fn default_keepalive_secs() -> u64 {
+    240
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_full_config() {
+        let yaml = r#"
+host: miniserver.example
+port: 8080
+user: logger
+password: s3cret
+server_key_pin: "sha256:deadbeef"
+token_uuid: 00000000-1111-2222-3333444455556666
+info: loxtap-test
+sink: debug
+log_level: debug
+reconnect:
+  backoff_base_secs: 5
+  backoff_max_secs: 120
+  keepalive_secs: 200
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.host, "miniserver.example");
+        assert_eq!(cfg.port, 8080);
+        assert_eq!(cfg.user, "logger");
+        assert_eq!(cfg.password, "s3cret");
+        assert_eq!(cfg.server_key_pin, "sha256:deadbeef");
+        assert_eq!(cfg.info, "loxtap-test");
+        assert_eq!(cfg.sink, SinkKind::Debug);
+        assert_eq!(cfg.log_level, "debug");
+        assert_eq!(cfg.reconnect.backoff_base_secs, 5);
+        assert_eq!(cfg.reconnect.backoff_max_secs, 120);
+        assert_eq!(cfg.reconnect.keepalive_secs, 200);
+    }
+
+    #[test]
+    fn applies_defaults_for_optional_knobs() {
+        let yaml = r#"
+host: miniserver.example
+user: logger
+password: s3cret
+server_key_pin: "sha256:deadbeef"
+token_uuid: 00000000-1111-2222-3333444455556666
+info: loxtap-test
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.port, 80);
+        assert_eq!(cfg.sink, SinkKind::Debug);
+        assert_eq!(cfg.log_level, "info");
+        assert_eq!(cfg.reconnect.backoff_base_secs, 2);
+        assert_eq!(cfg.reconnect.backoff_max_secs, 300);
+        assert_eq!(cfg.reconnect.keepalive_secs, 240);
+    }
+
+    #[test]
+    fn debug_redacts_password() {
+        let cfg = Config {
+            host: "miniserver.example".to_owned(),
+            port: 80,
+            user: "logger".to_owned(),
+            password: "s3cret".to_owned(),
+            server_key_pin: "sha256:deadbeef".to_owned(),
+            token_uuid: "00000000-1111-2222-3333444455556666".to_owned(),
+            info: "loxtap-test".to_owned(),
+            sink: SinkKind::Debug,
+            log_level: "info".to_owned(),
+            reconnect: ReconnectConfig::default(),
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("s3cret"));
+    }
+}
