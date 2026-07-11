@@ -21,23 +21,35 @@
 //! `permission = 4` (App): a daemon needs a weeks-long token, not the
 //! short-lived Web permission.
 //!
-//! On-disk token persistence and `authwithtoken` reuse are deferred to the
-//! supervisor phase; Milestone 1 holds the token in memory only.
+//! Once a token is held, the supervisor keeps it alive: [`refresh_token`] extends
+//! it before expiry and [`kill_token`] invalidates it on shutdown. Both use a
+//! *different* hash from login ([`token_hash`]): the plain `getkey` key (not
+//! getkey2's) over the token itself, not `user:pwHash`.
+//!
+//! On-disk token persistence and `authwithtoken` reuse are deferred; Milestone 1
+//! holds the token in memory only and does a fresh getjwt on every reconnect.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+use tracing::warn;
 
 use crate::config::Config;
 use crate::crypto::{CryptoError, Session};
-use crate::transport::Transport;
+use crate::transport::{Transport, TransportError};
 
 /// Command prefix that returns the per-user hashing key, salt and algorithm.
 const CMD_GET_KEY2: &str = "jdev/sys/getkey2/";
 /// Command prefix that exchanges the credential hash for a JSON web token.
 const CMD_GET_JWT: &str = "jdev/sys/getjwt/";
+/// Command that returns the ephemeral key used to hash a token on refresh/kill.
+const CMD_GET_KEY: &str = "jdev/sys/getkey";
+/// Command prefix that extends a token's validity.
+const CMD_REFRESH_JWT: &str = "jdev/sys/refreshjwt/";
+/// Command prefix that invalidates a token.
+const CMD_KILL_TOKEN: &str = "jdev/sys/killtoken/";
 
 /// Token permission level. `4` (App) yields a long-lived token, as a daemon
 /// needs; `2` (Web) is short-lived, so do not use it here.
@@ -57,10 +69,18 @@ type HmacSha256 = Hmac<Sha256>;
 pub enum AuthError {
     #[error(transparent)]
     Crypto(#[from] CryptoError),
+    #[error(transparent)]
+    Transport(#[from] TransportError),
     #[error("getkey2 failed with code {0}")]
     GetKey2(i64),
     #[error("getjwt failed with code {0}")]
     GetJwt(i64),
+    #[error("getkey failed with code {0}")]
+    GetKey(i64),
+    #[error("refreshjwt failed with code {0}")]
+    RefreshJwt(i64),
+    #[error("killtoken failed with code {0}")]
+    KillToken(i64),
     #[error("{context} reply missing the {field} field")]
     MissingField {
         context: &'static str,
@@ -193,6 +213,89 @@ pub async fn authenticate(
     Token::from_reply(resp.value(), &challenge.hash_alg, SystemTime::now())
 }
 
+/// `tokenHash = hex( HMAC-SHA256( key = hex_decode(getkey), msg = token ) )`.
+///
+/// The refresh/kill hash is deliberately unlike the login [`auth_hash`]: the key
+/// comes from the plain `getkey` (not getkey2), and the message is the *token*
+/// itself, not `user:pwHash`. Left lowercase, like `authHash`.
+pub fn token_hash(getkey_hex: &str, token: &str) -> Result<String, AuthError> {
+    let key = hex_decode(getkey_hex)?;
+    let mut mac = HmacSha256::new_from_slice(&key).expect("HMAC accepts any key length");
+    mac.update(token.as_bytes());
+    Ok(hex_lower(&mac.finalize().into_bytes()))
+}
+
+/// Fetch the ephemeral key used to hash the token for refresh/kill.
+///
+/// Goes through the `enc` channel: a live box *closes the connection* (WS 1000)
+/// on a plain `getkey` once encryption is active, so it must be encrypted like
+/// the other credential-adjacent commands. The reply rides `enc` rather than
+/// `fenc` because the key itself is not a secret (it only proves token
+/// possession in combination with the token), so a plaintext reply is fine.
+async fn fetch_token_key(
+    session: &mut Session,
+    transport: &mut Transport,
+) -> Result<String, AuthError> {
+    let resp = session.enc_command(transport, CMD_GET_KEY).await?;
+    if resp.code() != 200 {
+        return Err(AuthError::GetKey(resp.code()));
+    }
+    resp.value()
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| AuthError::missing("getkey", "value"))
+}
+
+/// Refresh the token before it expires, returning the updated [`Token`].
+///
+/// Hashes the current token with a fresh `getkey` key ([`token_hash`]) and sends
+/// `refreshjwt` over `fenc`, so a new token in the reply stays confidential on a
+/// clear transport. Code 477 means the token already lapsed, so fall back to a
+/// full re-authentication on the same session rather than give up.
+pub async fn refresh_token(
+    session: &mut Session,
+    transport: &mut Transport,
+    token: &Token,
+    config: &Config,
+) -> Result<Token, AuthError> {
+    let key = fetch_token_key(session, transport).await?;
+    let hash = token_hash(&key, token.token())?;
+    let cmd = format!("{CMD_REFRESH_JWT}{hash}/{}", config.user);
+    let resp = session.fenc_command(transport, &cmd).await?;
+    match resp.code() {
+        200 => Token::from_refresh_reply(resp.value(), token, SystemTime::now()),
+        477 => {
+            warn!("token expired before refresh, re-authenticating from scratch");
+            authenticate(session, transport, config).await
+        }
+        c => Err(AuthError::RefreshJwt(c)),
+    }
+}
+
+/// Invalidate the token on the server, freeing its slot.
+///
+/// Best-effort on graceful shutdown: hashes the token the same way as
+/// [`refresh_token`] and sends `killtoken` over `fenc`. Killing the very token
+/// that authenticates the session makes the Miniserver close the socket, so a
+/// disconnect right after the command is the success signal, not a failure.
+pub async fn kill_token(
+    session: &mut Session,
+    transport: &mut Transport,
+    token: &Token,
+    user: &str,
+) -> Result<(), AuthError> {
+    let key = fetch_token_key(session, transport).await?;
+    let hash = token_hash(&key, token.token())?;
+    let cmd = format!("{CMD_KILL_TOKEN}{hash}/{user}");
+    match session.fenc_command(transport, &cmd).await {
+        Ok(resp) if resp.code() == 200 => Ok(()),
+        Ok(resp) => Err(AuthError::KillToken(resp.code())),
+        // The token is gone and the server hung up: that is the confirmation.
+        Err(CryptoError::Transport(TransportError::Closed(_))) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// The material a getkey2 reply carries.
 struct KeyChallenge {
     /// The user salt to fold into the password hash.
@@ -266,6 +369,39 @@ impl Token {
             issued_at,
             key,
             hash_alg: hash_alg.to_owned(),
+        })
+    }
+
+    /// Build an updated token from a `refreshjwt` reply.
+    ///
+    /// The reply may return a fresh token JWT or only a new `validUntil`; keep
+    /// the previous token and key when the reply omits them. `issued_at` is reset
+    /// to now so the next refresh is scheduled off the new lifetime.
+    fn from_refresh_reply(
+        value: &Value,
+        previous: &Token,
+        issued_at: SystemTime,
+    ) -> Result<Self, AuthError> {
+        let token = value
+            .get("token")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| previous.token.clone());
+        let valid_until_lox = value
+            .get("validUntil")
+            .and_then(as_u64_flexible)
+            .ok_or_else(|| AuthError::missing("refreshjwt", "validUntil"))?;
+        let key = value
+            .get("key")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| previous.key.clone());
+        Ok(Self {
+            token,
+            valid_until: loxone_epoch_to_system_time(valid_until_lox),
+            issued_at,
+            key,
+            hash_alg: previous.hash_alg.clone(),
         })
     }
 }
@@ -487,5 +623,84 @@ mod tests {
         assert!(matches!(hex_decode("abc"), Err(AuthError::KeyDecode)));
         assert!(matches!(hex_decode("zz"), Err(AuthError::KeyDecode)));
         assert_eq!(hex_decode("00ff10").unwrap(), vec![0x00, 0xff, 0x10]);
+    }
+
+    #[test]
+    fn token_hash_matches_independent_vector() {
+        // Derived independently with Python's hmac/hashlib over this synthetic
+        // (key, token) pair:
+        //   hmac.new(bytes.fromhex(KEY), TOKEN.encode(), sha256).hexdigest()
+        const KEY_HEX: &str =
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        const TOKEN: &str = "eyJhbGciOiJIUzI1NiJ9.synthetic-token-body.sig";
+        const EXPECT: &str =
+            "7dd15b5e261db5f2528618b6a86939cb677caf18bffdc6dba037d4d00e81654f";
+        let th = token_hash(KEY_HEX, TOKEN).unwrap();
+        assert_eq!(th, EXPECT);
+        assert_eq!(th, th.to_lowercase(), "tokenHash must stay lowercase hex");
+    }
+
+    #[test]
+    fn token_hash_rejects_non_hex_key() {
+        assert!(matches!(token_hash("zz", "tok"), Err(AuthError::KeyDecode)));
+    }
+
+    #[test]
+    fn refresh_reply_advances_validity_and_keeps_token_when_absent() {
+        // A refresh reply carrying only a new validUntil keeps the token/key and
+        // resets issued_at, so the next refresh is scheduled off the new life.
+        let issued = UNIX_EPOCH + Duration::from_secs(1_785_000_000);
+        let base = Token::from_reply(
+            &json!({"token": "orig-token", "validUntil": 100u64, "key": "origkey"}),
+            "SHA256",
+            issued,
+        )
+        .unwrap();
+        let refreshed_at = UNIX_EPOCH + Duration::from_secs(1_785_100_000);
+        let updated =
+            Token::from_refresh_reply(&json!({"validUntil": 554_400_000u64}), &base, refreshed_at)
+                .unwrap();
+        assert_eq!(updated.token(), "orig-token");
+        assert_eq!(updated.key(), "origkey");
+        assert_eq!(updated.issued_at(), refreshed_at);
+        assert_eq!(
+            updated.valid_until().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            1_785_168_000
+        );
+    }
+
+    #[test]
+    fn refresh_reply_takes_new_token_when_present() {
+        let base = Token::from_reply(
+            &json!({"token": "orig", "validUntil": 1u64, "key": "k0"}),
+            "SHA256",
+            SystemTime::now(),
+        )
+        .unwrap();
+        let updated = Token::from_refresh_reply(
+            &json!({"token": "fresh", "validUntil": 554_400_000u64, "key": "k1"}),
+            &base,
+            SystemTime::now(),
+        )
+        .unwrap();
+        assert_eq!(updated.token(), "fresh");
+        assert_eq!(updated.key(), "k1");
+    }
+
+    #[test]
+    fn refresh_reply_requires_valid_until() {
+        let base = Token::from_reply(
+            &json!({"token": "orig", "validUntil": 1u64}),
+            "SHA256",
+            SystemTime::now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            Token::from_refresh_reply(&json!({"token": "fresh"}), &base, SystemTime::now()),
+            Err(AuthError::MissingField {
+                context: "refreshjwt",
+                field: "validUntil"
+            })
+        ));
     }
 }
