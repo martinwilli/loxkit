@@ -70,7 +70,9 @@ pub struct StateEntry {
     pub category: Option<String>,
     /// The state name under which this uuid was published.
     pub sub: String,
-    /// A display unit derived from the control's format, if any.
+    /// A display unit derived from the control's format. Set on the primary
+    /// `value` state only; other states (an `error` flag, status/enum states)
+    /// carry none, since the format describes the value.
     pub unit: Option<String>,
 }
 
@@ -287,6 +289,10 @@ fn index_control(
         .and_then(unit_from_format);
 
     for (sub, value) in &control.states {
+        // The control's `details.format` describes its primary `value` state;
+        // every other state (an analog sensor's `error` flag, a status/enum
+        // state) carries no unit of its own, so a wrong unit never beats none.
+        let entry_unit = if sub == "value" { unit.clone() } else { None };
         for uuid_str in state_uuids(value) {
             if let Ok(uuid) = uuid_str.parse::<LoxUuid>() {
                 out.insert(
@@ -297,7 +303,7 @@ fn index_control(
                         room: room.clone(),
                         category: category.clone(),
                         sub: sub.clone(),
-                        unit: unit.clone(),
+                        unit: entry_unit.clone(),
                     },
                 );
             }
@@ -429,7 +435,10 @@ mod tests {
           "room": "deadbeef-0000-0000-0000000000000001",
           "cat": "deadbeef-0000-0000-0000000000000002",
           "details": { "format": "%.1f°C" },
-          "states": { "value": "deadbeef-2222-0000-0000000000000001" }
+          "states": {
+            "value": "deadbeef-2222-0000-0000000000000001",
+            "error": "deadbeef-2222-0000-0000000000000002"
+          }
         },
         "deadbeef-1111-0000-0000000000000002": {
           "name": "Meter",
@@ -470,11 +479,29 @@ mod tests {
     fn parses_stamp_and_all_state_uuids() {
         let structure = Structure::parse(FIXTURE).unwrap();
         assert_eq!(structure.last_modified(), "2026-01-02 03:04:05");
-        // Five control states (one single-value, two array outputs, one
+        // Six control states (Temperature value + error, two Meter outputs, one
         // subcontrol, one Switch), two globalStates, plus three action
         // fallbacks (Temperature, Meter, Sub Meter — the Switch action
         // collides with its own state, so it adds none).
-        assert_eq!(structure.len(), 10);
+        assert_eq!(structure.len(), 11);
+    }
+
+    #[test]
+    fn format_unit_lands_only_on_the_value_state() {
+        let structure = Structure::parse(FIXTURE).unwrap();
+        // Temperature's format ("%.1f°C") units its value state...
+        let value = structure
+            .resolve(&uuid("deadbeef-2222-0000-0000000000000001"))
+            .unwrap();
+        assert_eq!(value.sub, "value");
+        assert_eq!(value.unit.as_deref(), Some("°C"));
+        // ...but not its error state, which carries no unit of its own.
+        let error = structure
+            .resolve(&uuid("deadbeef-2222-0000-0000000000000002"))
+            .unwrap();
+        assert_eq!(error.sub, "error");
+        assert_eq!(error.name, "Temperature");
+        assert_eq!(error.unit, None);
     }
 
     #[test]
