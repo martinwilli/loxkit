@@ -17,6 +17,11 @@
 //! owning control, room or category, so it is folded in flat, keyed on the
 //! state name as the label.
 //!
+//! A control's own `uuidAction` (the handle you command it by) can also stream a
+//! value, and it is not listed under `states`. It is indexed as an `action`
+//! fallback so it resolves to the control's labels rather than logging bare,
+//! but never over a real state that happens to share it.
+//!
 //! Freshness is cheap to check: `jdev/sps/LoxAPPversion3` returns the same
 //! `lastModified` stamp the structure file carries, so the (large) file is only
 //! re-fetched when that stamp changes.
@@ -237,6 +242,10 @@ struct RawControl {
     sub_controls: HashMap<String, RawControl>,
     #[serde(default)]
     details: Option<RawDetails>,
+    /// The uuid the control is commanded by. Not under `states`, but the box may
+    /// still stream a value for it, so it is indexed as an `action` fallback.
+    #[serde(rename = "uuidAction", default)]
+    uuid_action: Option<String>,
 }
 
 /// A control's display details; we mine the format string for a unit.
@@ -248,7 +257,9 @@ struct RawDetails {
 
 /// Invert one control's states into the flat map, then recurse into its
 /// subcontrols. `inherited_room`/`inherited_cat` are the parent's already
-/// resolved names, used when a subcontrol carries none of its own.
+/// resolved names, used when a subcontrol carries none of its own. The control's
+/// own `uuidAction` is indexed as an `action` fallback (see below) so it resolves
+/// even though it is not one of the `states`.
 fn index_control(
     out: &mut HashMap<LoxUuid, StateEntry>,
     control: &RawControl,
@@ -291,6 +302,29 @@ fn index_control(
                 );
             }
         }
+    }
+
+    // The value stream can also carry the control's own uuidAction value, which
+    // is not listed under `states`. Fall back to indexing it under a synthetic
+    // "action" sub so it resolves to at least the control's labels instead of
+    // logging bare. Never over a real state, though: for some control types the
+    // action uuid *is* a state uuid, and that state's descriptive sub must win.
+    // States above were inserted first and uuids are globally unique, so
+    // or_insert leaves any real state entry untouched.
+    if let Some(uuid) = control
+        .uuid_action
+        .as_deref()
+        .and_then(|s| s.parse::<LoxUuid>().ok())
+    {
+        out.entry(uuid).or_insert_with(|| StateEntry {
+            control: control.control_type.clone(),
+            name: control.name.clone(),
+            room: room.clone(),
+            category: category.clone(),
+            sub: "action".to_owned(),
+            // The action value carries no declared unit of its own.
+            unit: None,
+        });
     }
 
     for sub in control.sub_controls.values() {
@@ -372,8 +406,9 @@ mod tests {
     // A synthetic structure file with invented rooms, categories and uuids —
     // never a capture of a real Miniserver. It exercises the tricky shapes: a
     // single-uuid state, an array-valued state, a nested subcontrol that
-    // inherits its parent's room and category, plus the flat `globalStates`
-    // block that lives outside `controls{}`.
+    // inherits its parent's room and category, the flat `globalStates`
+    // block that lives outside `controls{}`, and a Switch whose uuidAction is
+    // one of its own state uuids (the action-fallback collision).
     const FIXTURE: &str = r#"{
       "lastModified": "2026-01-02 03:04:05",
       "rooms": {
@@ -416,6 +451,13 @@ mod tests {
               "states": { "value": "deadbeef-4444-0000-0000000000000001" }
             }
           }
+        },
+        "deadbeef-1111-0000-0000000000000003": {
+          "name": "Switch",
+          "type": "Switch",
+          "uuidAction": "deadbeef-2222-0000-0000000000000030",
+          "room": "deadbeef-0000-0000-0000000000000001",
+          "states": { "active": "deadbeef-2222-0000-0000000000000030" }
         }
       }
     }"#;
@@ -428,9 +470,41 @@ mod tests {
     fn parses_stamp_and_all_state_uuids() {
         let structure = Structure::parse(FIXTURE).unwrap();
         assert_eq!(structure.last_modified(), "2026-01-02 03:04:05");
-        // Four control states (one single-value, two array outputs, one
-        // subcontrol) plus two globalStates.
-        assert_eq!(structure.len(), 6);
+        // Five control states (one single-value, two array outputs, one
+        // subcontrol, one Switch), two globalStates, plus three action
+        // fallbacks (Temperature, Meter, Sub Meter — the Switch action
+        // collides with its own state, so it adds none).
+        assert_eq!(structure.len(), 10);
+    }
+
+    #[test]
+    fn indexes_uuid_action_as_action_fallback() {
+        let structure = Structure::parse(FIXTURE).unwrap();
+        // Temperature's uuidAction is not among its states, so it resolves to
+        // the control's labels under a synthetic "action" sub.
+        let entry = structure
+            .resolve(&uuid("deadbeef-1111-0000-0000000000000001"))
+            .unwrap();
+        assert_eq!(entry.name, "Temperature");
+        assert_eq!(entry.control, "InfoOnlyAnalog");
+        assert_eq!(entry.sub, "action");
+        assert_eq!(entry.room.as_deref(), Some("Room A"));
+        assert_eq!(entry.category.as_deref(), Some("Category X"));
+        // The action value has no declared unit, even though the control's state
+        // does (°C).
+        assert_eq!(entry.unit, None);
+    }
+
+    #[test]
+    fn uuid_action_does_not_override_a_real_state() {
+        let structure = Structure::parse(FIXTURE).unwrap();
+        // The Switch's uuidAction equals its "active" state uuid; the real state
+        // label must win over the generic action fallback.
+        let entry = structure
+            .resolve(&uuid("deadbeef-2222-0000-0000000000000030"))
+            .unwrap();
+        assert_eq!(entry.name, "Switch");
+        assert_eq!(entry.sub, "active");
     }
 
     #[test]
