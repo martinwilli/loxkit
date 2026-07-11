@@ -8,9 +8,11 @@
 //! The flow this module drives (see [`handshake`]):
 //!
 //! 1. `getPublicKey` -> parse the SPKI RSA key ([`ServerKey::fetch`]).
-//! 2. Generate a 32-byte AES key + 16-byte IV, RSA-encrypt them, and run
+//! 2. Verify the key's fingerprint against the configured pin, failing closed
+//!    before we ever trust it ([`ServerKey::verify_pin`]).
+//! 3. Generate a 32-byte AES key + 16-byte IV, RSA-encrypt them, and run
 //!    `keyexchange` to activate encryption ([`Session::establish`]).
-//! 3. Wrap subsequent commands as `enc` (plaintext reply) or `fenc` (encrypted
+//! 4. Wrap subsequent commands as `enc` (plaintext reply) or `fenc` (encrypted
 //!    reply) through the [`Session`].
 //!
 //! # Landmines baked in here
@@ -33,6 +35,7 @@ use rand::RngCore as _;
 use rand::rngs::OsRng;
 use rsa::pkcs8::DecodePublicKey as _;
 use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
@@ -81,11 +84,42 @@ pub enum CryptoError {
     KeyExchange(i64),
     #[error("could not decrypt the encrypted reply")]
     Decrypt,
+    #[error(transparent)]
+    Pin(#[from] PinError),
+}
+
+/// A server-key pin failure.
+///
+/// Both variants are fatal: the connection flow must refuse to start rather
+/// than encrypt a session key to an unvouched server. The supervisor treats
+/// this as terminal (a human decision), never a transient drop to retry.
+#[derive(Debug, thiserror::Error)]
+pub enum PinError {
+    #[error(
+        "no server key pin configured. the server presented this key:\n\
+         \n    server_key_pin: \"{presented}\"\n\n\
+         confirm this is your Miniserver, then paste that line into the config."
+    )]
+    Missing { presented: String },
+    #[error(
+        "server key pin mismatch, refusing to continue:\n\
+         \n    configured: {configured}\n    presented:  {presented}\n\n\
+         the server key changed. either a Miniserver factory reset rotated it, \
+         or someone is machine-in-the-middle on this connection."
+    )]
+    Mismatch {
+        configured: String,
+        presented: String,
+    },
 }
 
 /// The server's RSA public key, fetched over HTTP.
+///
+/// Retains the raw SPKI DER so the key can be fingerprinted and pinned before
+/// we trust it in the key exchange.
 pub struct ServerKey {
     public_key: RsaPublicKey,
+    spki_der: Vec<u8>,
 }
 
 impl ServerKey {
@@ -109,10 +143,39 @@ impl ServerKey {
     /// without a live transport.
     fn from_cert_pem(cert_pem: &str) -> Result<Self, CryptoError> {
         let body = spki_base64_body(cert_pem)?;
+        let spki_der = BASE64.decode(&body)?;
         let pem = rewrite_to_public_key_pem(&body);
         let public_key =
             RsaPublicKey::from_public_key_pem(&pem).map_err(|e| CryptoError::Spki(e.to_string()))?;
-        Ok(Self { public_key })
+        Ok(Self {
+            public_key,
+            spki_der,
+        })
+    }
+
+    /// The `sha256:<hex>` fingerprint of the DER SPKI public key.
+    ///
+    /// This equals `openssl pkey -pubin -outform DER | sha256sum`, so an
+    /// operator can reproduce and vouch for it by hand.
+    pub fn fingerprint(&self) -> String {
+        let digest = Sha256::digest(&self.spki_der);
+        format!("sha256:{}", hex_encode(digest.as_slice()))
+    }
+
+    /// Check the presented key against the configured pin, failing closed.
+    ///
+    /// Pass `None` when no pin is configured yet; the returned [`PinError`]
+    /// then carries the exact `server_key_pin:` line to paste.
+    pub fn verify_pin(&self, configured: Option<&str>) -> Result<(), PinError> {
+        let presented = self.fingerprint();
+        match configured {
+            None => Err(PinError::Missing { presented }),
+            Some(pin) if pin.trim() == presented => Ok(()),
+            Some(pin) => Err(PinError::Mismatch {
+                configured: pin.trim().to_owned(),
+                presented,
+            }),
+        }
     }
 }
 
@@ -295,18 +358,21 @@ impl Session {
     }
 }
 
-/// Fetch the server key and run the key exchange, returning the live session.
+/// Fetch the server key, verify it against the configured pin, then run the key
+/// exchange and return the live session.
 ///
-/// A later commit slots the server-key pin check between the fetch and the
-/// exchange, so this is the single entry point the connection flow calls. The
+/// The pin gate sits between the fetch and the exchange by construction: we
+/// refuse to encrypt our session key to a server we have not vouched for. The
 /// `host`/`port` drive the HTTP `getPublicKey` fetch; the key exchange rides the
 /// already-connected websocket `transport`.
 pub async fn handshake(
     transport: &mut Transport,
     host: &str,
     port: u16,
+    configured_pin: Option<&str>,
 ) -> Result<Session, CryptoError> {
     let server_key = ServerKey::fetch(host, port).await?;
+    server_key.verify_pin(configured_pin)?;
     Session::establish(transport, &server_key).await
 }
 
@@ -369,6 +435,12 @@ mod tests {
     // armor with the whole thing on a single line, no internal newlines.
     const SYNTH_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA58XDe2vyExplc7E+d4QMyyvb8/j5zpAiowbAJ9u0NZPJePtYYnDJKJBj+c/2U+57H071Wgky+xXBiY0pPCkJPR7yuu+lKgNpHOTRORwobCxC/oXwg2OcTbznW2WmtzhI4eWrKaZiHPj+D+BZe03H76XeYG6BEdwD3+7Kg9VIqQM41Ro1TdBeECDaVjY6BI+DXXyY+/N3pH2m2yGmsIgQl8VQZ1qVsprGuusrEsLS1tLQzkQgNWbcwPxNa86tBIcE27IjKIUxyZJbUGTKwsvZl6tIQXNjKjpPw6vXuyMFal/5y35z5q9PDmDx/J+HBM/eL/1rTkPTEx6Xdf4LpExM7wIDAQAB-----END CERTIFICATE-----";
 
+    // The precomputed SHA-256 of that key's DER SPKI, i.e. the pin an operator
+    // would paste. Reproducible with:
+    //   openssl pkey -pubin -outform DER | sha256sum
+    const SYNTH_PIN: &str =
+        "sha256:1e6eea5c17ed190396f589153450a51ca435feeacd80d7354c32718e29e31252";
+
     #[test]
     fn aes_zero_pad_cbc_round_trips() {
         let key = [0x11u8; 32];
@@ -423,6 +495,44 @@ mod tests {
     fn parses_rewritten_public_key() {
         // The rewrite must yield a PEM the RSA parser accepts.
         assert!(ServerKey::from_cert_pem(SYNTH_CERT_PEM).is_ok());
+    }
+
+    #[test]
+    fn fingerprint_matches_known_vector() {
+        let key = ServerKey::from_cert_pem(SYNTH_CERT_PEM).unwrap();
+        assert_eq!(key.fingerprint(), SYNTH_PIN);
+    }
+
+    #[test]
+    fn verify_pin_accepts_match() {
+        let key = ServerKey::from_cert_pem(SYNTH_CERT_PEM).unwrap();
+        assert!(key.verify_pin(Some(SYNTH_PIN)).is_ok());
+        // Surrounding whitespace in the configured value is tolerated.
+        assert!(key.verify_pin(Some(&format!("  {SYNTH_PIN}  "))).is_ok());
+    }
+
+    #[test]
+    fn verify_pin_rejects_mismatch_carrying_both_pins() {
+        let key = ServerKey::from_cert_pem(SYNTH_CERT_PEM).unwrap();
+        let wrong = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let err = key.verify_pin(Some(wrong)).unwrap_err();
+        assert!(matches!(err, PinError::Mismatch { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains(wrong), "mismatch must show the configured pin");
+        assert!(msg.contains(SYNTH_PIN), "mismatch must show the presented pin");
+    }
+
+    #[test]
+    fn verify_pin_rejects_missing_with_paste_line() {
+        let key = ServerKey::from_cert_pem(SYNTH_CERT_PEM).unwrap();
+        let err = key.verify_pin(None).unwrap_err();
+        assert!(matches!(err, PinError::Missing { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains(SYNTH_PIN), "missing must show the presented pin");
+        assert!(
+            msg.contains(&format!("server_key_pin: \"{SYNTH_PIN}\"")),
+            "missing must print the exact paste-ready line"
+        );
     }
 
     #[test]
