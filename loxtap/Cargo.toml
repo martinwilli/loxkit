@@ -7,6 +7,7 @@ license = "MIT"
 [dependencies]
 aes = "0.9"
 anyhow = "1.0.103"
+async-trait = "0.1"
 base64 = "0.22"
 block-padding = "0.4"
 cbc = { version = "0.2", features = ["alloc", "block-padding"] }
