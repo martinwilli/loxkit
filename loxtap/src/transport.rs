@@ -16,6 +16,8 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::http::header::{HeaderValue, SEC_WEBSOCKET_PROTOCOL};
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 /// WebSocket resource path the Miniserver serves.
@@ -182,8 +184,8 @@ pub enum TransportError {
     UnknownType(u8),
     #[error("unexpected websocket frame in binary sequence")]
     UnexpectedFrame,
-    #[error("connection closed")]
-    Closed,
+    #[error("connection closed (code {0:?})")]
+    Closed(Option<u16>),
     #[error(transparent)]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
     #[error("malformed JSON response: {0}")]
@@ -198,6 +200,13 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub struct Transport {
     write: SplitSink<Ws, Message>,
     read: SplitStream<Ws>,
+    /// A header whose payload has not been read yet. Buffered so [`next_inbound`]
+    /// stays cancel-safe: a `select!` caller cancels the read to service a timer,
+    /// and on the next call we resume with the header intact rather than reading
+    /// the payload frame as if it were a new header (which would desync).
+    ///
+    /// [`next_inbound`]: Transport::next_inbound
+    pending_header: Option<MessageHeader>,
 }
 
 impl Transport {
@@ -211,7 +220,11 @@ impl Transport {
             .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static(SUBPROTOCOL));
         let (ws, _response) = connect_async(request).await?;
         let (write, read) = ws.split();
-        Ok(Self { write, read })
+        Ok(Self {
+            write,
+            read,
+            pending_header: None,
+        })
     }
 
     /// Send a text command and await its `LL` JSON reply.
@@ -236,54 +249,87 @@ impl Transport {
 
     /// Read and classify the next inbound message, resolving the binary
     /// header/payload two-frame dance (including the estimated-then-exact case).
+    ///
+    /// Cancel-safe: the supervisor drives this in a `select!` and cancels it when
+    /// a keepalive or refresh timer fires. The resolved header is buffered before
+    /// its payload is awaited, so a cancellation mid-dance resumes on the next
+    /// call instead of reading the payload as a bogus header.
     pub async fn next_inbound(&mut self) -> Result<Inbound, TransportError> {
+        // Resume a dance a previous (cancelled) call left mid-flight.
+        if let Some(header) = self.pending_header.take() {
+            return self.read_payload(header).await;
+        }
         match self.read_message().await? {
             Message::Text(t) => Ok(Inbound::Text(t.as_str().to_owned())),
             Message::Binary(b) => {
                 let mut header = MessageHeader::parse(b.as_ref())?;
                 if header.estimated {
-                    // An exact header frame precedes the real payload.
+                    // An exact header frame precedes the real payload. Cancelling
+                    // here only drops the (redundant) estimated header; the exact
+                    // one is a valid standalone header on the next call.
                     let Message::Binary(exact) = self.read_message().await? else {
                         return Err(TransportError::UnexpectedFrame);
                     };
                     header = MessageHeader::parse(exact.as_ref())?;
                 }
-                if header.len == 0 {
-                    return Ok(Inbound::Binary {
-                        header,
-                        payload: Vec::new(),
-                    });
-                }
-                match self.read_message().await? {
-                    Message::Binary(payload) => Ok(Inbound::Binary {
-                        header,
-                        payload: payload.to_vec(),
-                    }),
-                    // Text-class messages announce a header, then deliver the
-                    // body as a text frame.
-                    Message::Text(t) => Ok(Inbound::Text(t.as_str().to_owned())),
-                    _ => Err(TransportError::UnexpectedFrame),
-                }
+                self.read_payload(header).await
             }
             _ => Err(TransportError::UnexpectedFrame),
         }
     }
 
-    /// Close the connection.
+    /// Read the payload frame for an already-resolved `header`.
+    ///
+    /// The header is re-buffered before the payload read is awaited and cleared
+    /// only once it resolves, so a cancellation leaves the header in place for
+    /// [`next_inbound`](Self::next_inbound) to resume from.
+    async fn read_payload(&mut self, header: MessageHeader) -> Result<Inbound, TransportError> {
+        if header.len == 0 {
+            return Ok(Inbound::Binary {
+                header,
+                payload: Vec::new(),
+            });
+        }
+        self.pending_header = Some(header);
+        let msg = self.read_message().await;
+        // Reached only if the read resolved (a cancellation drops the future
+        // before this line, keeping pending_header set for the resume path).
+        self.pending_header = None;
+        match msg? {
+            Message::Binary(payload) => Ok(Inbound::Binary {
+                header,
+                payload: payload.to_vec(),
+            }),
+            // Text-class messages announce a header, then deliver the body as a
+            // text frame.
+            Message::Text(t) => Ok(Inbound::Text(t.as_str().to_owned())),
+            _ => Err(TransportError::UnexpectedFrame),
+        }
+    }
+
+    /// Close the connection with a normal-closure (1000) status.
     pub async fn close(&mut self) -> Result<(), TransportError> {
-        self.write.send(Message::Close(None)).await?;
+        let frame = CloseFrame {
+            code: CloseCode::Normal,
+            reason: "".into(),
+        };
+        self.write.send(Message::Close(Some(frame))).await?;
         Ok(())
     }
 
     /// Pull the next content frame, answering pings and skipping pongs/raw
-    /// frames; a close or an ended stream surfaces as [`TransportError::Closed`].
+    /// frames; a close or an ended stream surfaces as [`TransportError::Closed`],
+    /// carrying the peer's close code when it sent one (so the supervisor can
+    /// tell a routine drop from a 4003 lockout or a 4004/4005 user change).
     async fn read_message(&mut self) -> Result<Message, TransportError> {
         loop {
-            let msg = self.read.next().await.ok_or(TransportError::Closed)??;
+            let msg = self.read.next().await.ok_or(TransportError::Closed(None))??;
             match msg {
                 Message::Ping(payload) => self.write.send(Message::Pong(payload)).await?,
                 Message::Pong(_) | Message::Frame(_) => {}
-                Message::Close(_) => return Err(TransportError::Closed),
+                Message::Close(frame) => {
+                    return Err(TransportError::Closed(frame.map(|f| u16::from(f.code))));
+                }
                 content => return Ok(content),
             }
         }
@@ -391,6 +437,54 @@ mod tests {
         assert_eq!(resp.control(), "jdev/cfg/apiKey");
         assert_eq!(resp.code(), 200);
         assert_eq!(resp.value().as_str(), Some("1.2.3.4"));
+
+        transport.close().await.unwrap();
+        server.await.unwrap();
+    }
+
+    // The binary two-frame dance (header frame, then payload frame) must resolve
+    // into a single `Inbound::Binary`; this is the path a cancelled read resumes.
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn next_inbound_resolves_header_then_payload() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_hdr_async;
+        use tokio_tungstenite::tungstenite::handshake::server::{
+            ErrorResponse, Request, Response,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_hdr_async(stream, |_req: &Request, mut resp: Response| {
+                resp.headers_mut()
+                    .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static(SUBPROTOCOL));
+                Ok::<Response, ErrorResponse>(resp)
+            })
+            .await
+            .unwrap();
+
+            // A value-states header (type 2, len 24) then a 24-byte payload.
+            let header = [0x03, 0x02, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00];
+            ws.send(Message::Binary(header.to_vec().into())).await.unwrap();
+            ws.send(Message::Binary(vec![0xabu8; 24].into())).await.unwrap();
+            let _ = ws.next().await; // wait for the client's close
+        });
+
+        let mut transport = Transport::connect(&addr.ip().to_string(), addr.port())
+            .await
+            .unwrap();
+        match transport.next_inbound().await.unwrap() {
+            Inbound::Binary { header, payload } => {
+                assert_eq!(header.msg_type, MessageType::ValueStates);
+                assert_eq!(header.len, 24);
+                assert_eq!(payload, vec![0xabu8; 24]);
+            }
+            other => panic!("expected a binary message, got {other:?}"),
+        }
+        assert!(transport.pending_header.is_none(), "header must be cleared after the payload");
 
         transport.close().await.unwrap();
         server.await.unwrap();
