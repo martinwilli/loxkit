@@ -22,6 +22,11 @@
 //! fallback so it resolves to the control's labels rather than logging bare,
 //! but never over a real state that happens to share it.
 //!
+//! A control can also define `statistic.outputs`: named, printf-formatted series
+//! the operator chose to log. Each output carries its own name and unit, so it
+//! wins over a plain state label for the same uuid, and some outputs have a
+//! dedicated uuid that is not a state at all.
+//!
 //! Freshness is cheap to check: `jdev/sps/LoxAPPversion3` returns the same
 //! `lastModified` stamp the structure file carries, so the (large) file is only
 //! re-fetched when that stamp changes.
@@ -248,6 +253,10 @@ struct RawControl {
     /// still stream a value for it, so it is indexed as an `action` fallback.
     #[serde(rename = "uuidAction", default)]
     uuid_action: Option<String>,
+    /// Operator-configured logged series, each with its own name, format and
+    /// uuid. Self-describing, so they win over a plain state label.
+    #[serde(default)]
+    statistic: Option<RawStatistic>,
 }
 
 /// A control's display details; we mine the format string for a unit.
@@ -255,6 +264,24 @@ struct RawControl {
 struct RawDetails {
     #[serde(default)]
     format: Option<String>,
+}
+
+/// The `statistic` block on a control: the outputs it logs.
+#[derive(Deserialize)]
+struct RawStatistic {
+    #[serde(default)]
+    outputs: Vec<RawStatOutput>,
+}
+
+/// One statistic output: a named, printf-formatted series with its own uuid.
+#[derive(Deserialize)]
+struct RawStatOutput {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    uuid: Option<String>,
 }
 
 /// Invert one control's states into the flat map, then recurse into its
@@ -307,6 +334,37 @@ fn index_control(
                     },
                 );
             }
+        }
+    }
+
+    // Statistic outputs are the series the operator configured this control to
+    // log, each with its own name and printf format. They win over a plain state
+    // label for the same uuid (a chosen name and unit beat the terse state sub),
+    // and some outputs have a dedicated uuid that is no state at all. Insert (not
+    // or_insert) so they overwrite any state entry above; uuids are globally
+    // unique, so this only ever replaces this control's own state.
+    if let Some(statistic) = &control.statistic {
+        for output in &statistic.outputs {
+            let Some(uuid) = output
+                .uuid
+                .as_deref()
+                .and_then(|s| s.parse::<LoxUuid>().ok())
+            else {
+                continue;
+            };
+            out.insert(
+                uuid,
+                StateEntry {
+                    control: control.control_type.clone(),
+                    name: output.name.clone(),
+                    room: room.clone(),
+                    category: category.clone(),
+                    // The name is authoritative; carry it as the sub too so the
+                    // sink renders one clean name rather than name/sub.
+                    sub: output.name.clone(),
+                    unit: output.format.as_deref().and_then(unit_from_format),
+                },
+            );
         }
     }
 
@@ -413,8 +471,10 @@ mod tests {
     // never a capture of a real Miniserver. It exercises the tricky shapes: a
     // single-uuid state, an array-valued state, a nested subcontrol that
     // inherits its parent's room and category, the flat `globalStates`
-    // block that lives outside `controls{}`, and a Switch whose uuidAction is
-    // one of its own state uuids (the action-fallback collision).
+    // block that lives outside `controls{}`, a Switch whose uuidAction is
+    // one of its own state uuids (the action-fallback collision), and a
+    // Solar control with statistic outputs (one overlapping a state, one
+    // dedicated).
     const FIXTURE: &str = r#"{
       "lastModified": "2026-01-02 03:04:05",
       "rooms": {
@@ -467,6 +527,20 @@ mod tests {
           "uuidAction": "deadbeef-2222-0000-0000000000000030",
           "room": "deadbeef-0000-0000-0000000000000001",
           "states": { "active": "deadbeef-2222-0000-0000000000000030" }
+        },
+        "deadbeef-1111-0000-0000000000000004": {
+          "name": "Solar",
+          "type": "Fronius",
+          "uuidAction": "deadbeef-1111-0000-0000000000000004",
+          "room": "deadbeef-0000-0000-0000000000000001",
+          "cat": "deadbeef-0000-0000-0000000000000002",
+          "states": { "prodCurr": "deadbeef-6666-0000-0000000000000001" },
+          "statistic": {
+            "outputs": [
+              { "id": 0, "name": "Leistung Produktion", "format": "%.3f kW", "uuid": "deadbeef-6666-0000-0000000000000001" },
+              { "id": 1, "name": "Zähler Produktion", "format": "%.3f kWh", "uuid": "deadbeef-6666-0000-0000000000000002" }
+            ]
+          }
         }
       }
     }"#;
@@ -479,11 +553,42 @@ mod tests {
     fn parses_stamp_and_all_state_uuids() {
         let structure = Structure::parse(FIXTURE).unwrap();
         assert_eq!(structure.last_modified(), "2026-01-02 03:04:05");
-        // Six control states (Temperature value + error, two Meter outputs, one
-        // subcontrol, one Switch), two globalStates, plus three action
-        // fallbacks (Temperature, Meter, Sub Meter — the Switch action
-        // collides with its own state, so it adds none).
-        assert_eq!(structure.len(), 11);
+        // Seven state uuids (Temperature value + error, two Meter outputs, one
+        // subcontrol, one Switch, one Solar prodCurr), two globalStates, one
+        // statistic-only output (Solar's second; the first overwrites the
+        // prodCurr state, no new key), and four action fallbacks (Temperature,
+        // Meter, Sub Meter, Solar — the Switch action collides with its own
+        // state).
+        assert_eq!(structure.len(), 14);
+    }
+
+    #[test]
+    fn statistic_output_resolves_with_its_own_name_and_unit() {
+        let structure = Structure::parse(FIXTURE).unwrap();
+        // A statistic-only uuid (no matching state) resolves to the output's own
+        // name and format-derived unit, under the owning control's room/category.
+        let entry = structure
+            .resolve(&uuid("deadbeef-6666-0000-0000000000000002"))
+            .unwrap();
+        assert_eq!(entry.name, "Zähler Produktion");
+        assert_eq!(entry.unit.as_deref(), Some("kWh"));
+        assert_eq!(entry.room.as_deref(), Some("Room A"));
+        assert_eq!(entry.category.as_deref(), Some("Category X"));
+        assert_eq!(entry.control, "Fronius");
+    }
+
+    #[test]
+    fn statistic_output_wins_over_a_state_for_the_same_uuid() {
+        let structure = Structure::parse(FIXTURE).unwrap();
+        // Solar's prodCurr state and statistic output id 0 share a uuid; the
+        // statistic's chosen name and unit win over the terse state.
+        let entry = structure
+            .resolve(&uuid("deadbeef-6666-0000-0000000000000001"))
+            .unwrap();
+        assert_eq!(entry.name, "Leistung Produktion");
+        assert_eq!(entry.unit.as_deref(), Some("kW"));
+        // sub mirrors the name so the sink renders one clean label, not name/sub.
+        assert_eq!(entry.sub, "Leistung Produktion");
     }
 
     #[test]
