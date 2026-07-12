@@ -35,7 +35,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, NoTls};
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::Sink;
 use crate::config::TimescaleConfig;
@@ -106,7 +106,54 @@ impl TimescaleSink {
             .user(&config.user)
             .password(&config.password)
             .dbname(&config.dbname);
-        Self::from_pg_config(pg_config).await
+        let sink = Self::from_pg_config(pg_config).await?;
+        sink.apply_timezone(config.timezone.as_deref()).await?;
+        Ok(sink)
+    }
+
+    /// Pin the database's default timezone if the config requested one.
+    ///
+    /// Runs `ALTER DATABASE … SET TimeZone`, which is what makes the calendar-aware
+    /// bucketing (daily/monthly dashboard rollups) align to local time; the stored
+    /// data is untouched, every `ts` is a UTC instant regardless. It takes effect on
+    /// connections opened *after* it, so the daemon's own session (which does no
+    /// calendar math) need not care, but a querying client that reconnects picks it
+    /// up. The zone name is checked against `pg_timezone_names` first so a config
+    /// typo fails loud here instead of silently breaking every later session, and the
+    /// statement is assembled by Postgres's own `format(%I, %L)` because ALTER
+    /// DATABASE takes no bind parameter for the identifier or the value. A privilege
+    /// failure on the ALTER (the role must own the database) is logged, not fatal:
+    /// ingestion is the daemon's real job and must not hinge on a display setting.
+    async fn apply_timezone(&self, timezone: Option<&str>) -> anyhow::Result<()> {
+        let Some(tz) = timezone else {
+            return Ok(());
+        };
+        let client = self.client.lock().await;
+
+        let known: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_timezone_names WHERE name = $1)",
+                &[&tz],
+            )
+            .await
+            .context("checking the configured timezone against pg_timezone_names")?
+            .get(0);
+        anyhow::ensure!(known, "configured timezone {tz:?} is not a known IANA zone name");
+
+        let stmt: String = client
+            .query_one(
+                "SELECT format('ALTER DATABASE %I SET TimeZone TO %L', current_database(), $1::text)",
+                &[&tz],
+            )
+            .await
+            .context("building the ALTER DATABASE statement")?
+            .get(0);
+
+        match client.batch_execute(&stmt).await {
+            Ok(()) => info!("database default timezone set to {tz:?} (effective on new connections)"),
+            Err(e) => warn!("could not set database timezone to {tz:?} (own the database?): {e:#}"),
+        }
+        Ok(())
     }
 
     /// Build the sink from an already-assembled Postgres config: connect, spawn
