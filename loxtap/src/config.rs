@@ -31,6 +31,13 @@ pub struct TimescaleConfig {
     /// connects with NoTls (a trusted LAN is assumed; TLS is a later concern).
     #[serde(default)]
     pub sslmode: Option<String>,
+    /// Optional IANA timezone (e.g. `Europe/Zurich`) to pin as the database's
+    /// default. Calendar bucketing (the daily/monthly dashboard rollups) then
+    /// aligns to local time instead of UTC; unset leaves the server default
+    /// untouched. The sink applies it on startup, so it governs every client
+    /// that queries the store, not just the daemon. Stored timestamps stay UTC.
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 impl fmt::Debug for TimescaleConfig {
@@ -42,6 +49,7 @@ impl fmt::Debug for TimescaleConfig {
             .field("password", &"<redacted>")
             .field("dbname", &self.dbname)
             .field("sslmode", &self.sslmode)
+            .field("timezone", &self.timezone)
             .finish()
     }
 }
@@ -255,11 +263,31 @@ timescale:
         assert_eq!(ts.password, "pgs3cret");
         assert_eq!(ts.dbname, "loxtap");
         assert_eq!(ts.sslmode, None);
+        assert_eq!(ts.timezone, None);
 
         // The section's password must not leak through its Debug either.
         let rendered = format!("{ts:?}");
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("pgs3cret"));
+    }
+
+    #[test]
+    fn parses_timescale_timezone() {
+        let yaml = r#"
+miniserver:
+  host: miniserver.example
+  user: logger
+  password: s3cret
+  server_key_pin: "sha256:deadbeef"
+timescale:
+  host: db.example
+  user: loxtap
+  password: pgs3cret
+  dbname: loxtap
+  timezone: "Europe/Zurich"
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.timescale.unwrap().timezone.as_deref(), Some("Europe/Zurich"));
     }
 
     #[test]

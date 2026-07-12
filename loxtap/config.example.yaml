@@ -35,3 +35,8 @@ timescale:
   user: loxtap
   password: password
   dbname: loxtap
+  # Optional IANA timezone to pin as the store's default, e.g. "Europe/Zurich",
+  # so the daily/monthly dashboard rollups bucket in local time instead of UTC.
+  # Applied with ALTER DATABASE on startup (the daemon must own the database);
+  # unset leaves the server default. Stored timestamps are UTC either way.
+  # timezone: "Region/City"
