@@ -15,10 +15,11 @@
 //! Milestone 1 ships only the [`debug`] sink; a later milestone plugs a real
 //! store in behind this same trait, additively.
 
-use crate::config::SinkKind;
+use crate::config::{Config, SinkKind};
 use crate::model::{Reading, SeriesMeta};
 
 pub mod debug;
+pub mod timescale;
 
 /// A destination for resolved readings and their labels.
 ///
@@ -36,10 +37,17 @@ pub trait Sink: Send + Sync {
 
 /// Construct the sink named by the config selector.
 ///
-/// The single seam the daemon uses to pick a backend; a later milestone adds
-/// its arm here without touching the callers.
-pub fn build(kind: SinkKind) -> Box<dyn Sink> {
-    match kind {
-        SinkKind::Debug => Box::new(debug::DebugSink::new()),
+/// The single seam the daemon uses to pick a backend. It is async and fallible
+/// because a real store connects (and runs its startup migrations) here, either
+/// of which can fail.
+pub async fn build(config: &Config) -> anyhow::Result<Box<dyn Sink>> {
+    match config.sink {
+        SinkKind::Debug => Ok(Box::new(debug::DebugSink::new())),
+        SinkKind::Timescale => {
+            let ts = config.timescale.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("sink 'timescale' selected but no 'timescale:' config section present")
+            })?;
+            Ok(Box::new(timescale::TimescaleSink::connect(ts).await?))
+        }
     }
 }

@@ -17,6 +17,44 @@ pub enum SinkKind {
     /// Log each resolved reading via `tracing`; the only sink in Milestone 1.
     #[default]
     Debug,
+    /// Write into a TimescaleDB (Postgres) store; needs a `timescale:` section.
+    Timescale,
+}
+
+/// TimescaleDB (Postgres) connection parameters for the Timescale sink.
+///
+/// The password is redacted from [`fmt::Debug`] just as the Miniserver one is,
+/// so logging the whole config stays safe.
+#[derive(Clone, Deserialize)]
+pub struct TimescaleConfig {
+    /// Database host.
+    pub host: String,
+    /// Database port.
+    #[serde(default = "default_pg_port")]
+    pub port: u16,
+    /// Login user.
+    pub user: String,
+    /// Login password.
+    pub password: String,
+    /// Database name.
+    pub dbname: String,
+    /// TLS mode, carried for forward-compat but **not yet enforced**: the sink
+    /// connects with NoTls (a trusted LAN is assumed; TLS is a later concern).
+    #[serde(default)]
+    pub sslmode: Option<String>,
+}
+
+impl fmt::Debug for TimescaleConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TimescaleConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("dbname", &self.dbname)
+            .field("sslmode", &self.sslmode)
+            .finish()
+    }
 }
 
 /// Reconnect and keepalive timing.
@@ -69,6 +107,9 @@ pub struct Config {
     /// Which sink to write into.
     #[serde(default)]
     pub sink: SinkKind,
+    /// TimescaleDB connection; required when `sink: timescale` is selected.
+    #[serde(default)]
+    pub timescale: Option<TimescaleConfig>,
     /// Fallback log level when `RUST_LOG` is unset.
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -102,6 +143,7 @@ impl fmt::Debug for Config {
             .field("token_uuid", &self.token_uuid)
             .field("info", &self.info)
             .field("sink", &self.sink)
+            .field("timescale", &self.timescale)
             .field("log_level", &self.log_level)
             .field("reconnect", &self.reconnect)
             .finish()
@@ -110,6 +152,10 @@ impl fmt::Debug for Config {
 
 fn default_port() -> u16 {
     80
+}
+
+fn default_pg_port() -> u16 {
+    5432
 }
 
 fn default_log_level() -> String {
@@ -193,11 +239,64 @@ info: loxtap-test
             token_uuid: "00000000-1111-2222-3333444455556666".to_owned(),
             info: "loxtap-test".to_owned(),
             sink: SinkKind::Debug,
+            timescale: None,
             log_level: "info".to_owned(),
             reconnect: ReconnectConfig::default(),
         };
         let rendered = format!("{cfg:?}");
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("s3cret"));
+    }
+
+    #[test]
+    fn parses_timescale_section_and_redacts_its_password() {
+        let yaml = r#"
+host: miniserver.example
+user: logger
+password: s3cret
+server_key_pin: "sha256:deadbeef"
+token_uuid: 00000000-1111-2222-3333444455556666
+info: loxtap-test
+sink: timescale
+timescale:
+  host: db.example
+  port: 5433
+  user: loxtap
+  password: pgs3cret
+  dbname: loxtap
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.sink, SinkKind::Timescale);
+        let ts = cfg.timescale.expect("timescale section present");
+        assert_eq!(ts.host, "db.example");
+        assert_eq!(ts.port, 5433);
+        assert_eq!(ts.user, "loxtap");
+        assert_eq!(ts.password, "pgs3cret");
+        assert_eq!(ts.dbname, "loxtap");
+        assert_eq!(ts.sslmode, None);
+
+        // The section's password must not leak through its Debug either.
+        let rendered = format!("{ts:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("pgs3cret"));
+    }
+
+    #[test]
+    fn timescale_port_defaults_to_5432() {
+        let yaml = r#"
+host: miniserver.example
+user: logger
+password: s3cret
+server_key_pin: "sha256:deadbeef"
+token_uuid: 00000000-1111-2222-3333444455556666
+info: loxtap-test
+timescale:
+  host: db.example
+  user: loxtap
+  password: pgs3cret
+  dbname: loxtap
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.timescale.unwrap().port, 5432);
     }
 }
