@@ -2,28 +2,29 @@
 # All placeholders below are examples, not working credentials.
 
 # Miniserver connection.
-host: miniserver.example
-port: 80
+miniserver:
+  host: miniserver.example
+  port: 80
 
-# Login credentials for the Miniserver user the daemon authenticates as.
-user: user
-password: password
+  # Login credentials for the Miniserver user the daemon authenticates as.
+  user: user
+  password: password
 
-# SHA-256 pin of the Miniserver's public key, as printed on first connect.
-# Enforced by the crypto handshake: the daemon refuses to start on a mismatch.
-server_key_pin: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  # SHA-256 pin of the Miniserver's public key, as printed on first connect.
+  # Enforced by the crypto handshake: the daemon refuses to start on a mismatch.
+  server_key_pin: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+  # Reconnect and keepalive timing (seconds). Defaults shown; all optional.
+  reconnect:
+    backoff_base_secs: 2
+    backoff_max_secs: 300
+    keepalive_secs: 240
 
 # The client id the server tracks tokens under, and its device-list label, are
 # derived from the host (machine-id and hostname), so nothing goes here.
 
 # Fallback log level when RUST_LOG is unset (error, warn, info, debug, trace).
 log_level: info
-
-# Reconnect and keepalive timing (seconds). Defaults shown; all optional.
-reconnect:
-  backoff_base_secs: 2
-  backoff_max_secs: 300
-  keepalive_secs: 240
 
 # TimescaleDB sink connection. Defining this section selects the TimescaleDB
 # sink; drop or comment it out to fall back to the debug sink. Plain Postgres

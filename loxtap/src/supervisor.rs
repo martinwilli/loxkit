@@ -98,8 +98,8 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
     let identity = ClientIdentity::resolve()?;
     let sink = sink::build(config).await?;
     let mut shutdown = install_shutdown();
-    let base = Duration::from_secs(config.reconnect.backoff_base_secs);
-    let max = Duration::from_secs(config.reconnect.backoff_max_secs);
+    let base = Duration::from_secs(config.miniserver.reconnect.backoff_base_secs);
+    let max = Duration::from_secs(config.miniserver.reconnect.backoff_max_secs);
     let mut rng = rand::thread_rng();
     let mut attempt: u32 = 0;
 
@@ -189,14 +189,14 @@ async fn establish(
     config: &Config,
     identity: &ClientIdentity,
 ) -> Result<Established, SessionOutcome> {
-    let mut transport = Transport::connect(&config.host, config.port)
+    let mut transport = Transport::connect(&config.miniserver.host, config.miniserver.port)
         .await
         .map_err(|e| retryable("connect", e))?;
     let mut session = match handshake(
         &mut transport,
-        &config.host,
-        config.port,
-        Some(&config.server_key_pin),
+        &config.miniserver.host,
+        config.miniserver.port,
+        Some(&config.miniserver.server_key_pin),
     )
     .await
     {
@@ -235,7 +235,7 @@ async fn event_loop(
         return retryable("enable updates", e);
     }
 
-    let keepalive_period = Duration::from_secs(config.reconnect.keepalive_secs.max(1));
+    let keepalive_period = Duration::from_secs(config.miniserver.reconnect.keepalive_secs.max(1));
     let mut keepalive = tokio::time::interval(keepalive_period);
     keepalive.tick().await; // drop the immediate first tick
 
@@ -313,7 +313,7 @@ async fn graceful_shutdown(
     config: &Config,
 ) -> SessionOutcome {
     info!("shutdown requested; killing token and closing");
-    match auth::kill_token(session, transport, token, &config.user).await {
+    match auth::kill_token(session, transport, token, &config.miniserver.user).await {
         Ok(()) => info!("token killed"),
         Err(e) => warn!("killtoken failed during shutdown: {e:#}"),
     }

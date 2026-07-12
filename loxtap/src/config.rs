@@ -72,9 +72,12 @@ impl Default for ReconnectConfig {
     }
 }
 
-/// The full daemon configuration.
+/// Miniserver connection settings.
+///
+/// The password is redacted from [`fmt::Debug`] just as the Timescale one is,
+/// so logging the whole config stays safe.
 #[derive(Clone, Deserialize)]
-pub struct Config {
+pub struct MiniserverConfig {
     /// Miniserver hostname or IP.
     pub host: String,
     /// Miniserver port (carries no default field on the wire, so we require it).
@@ -84,11 +87,35 @@ pub struct Config {
     pub user: String,
     /// Login password.
     pub password: String,
-    /// SHA-256 pin of the server's public key as `sha256:<hex>`.
-    ///
-    /// Present here from the start, but only *enforced* by the crypto
-    /// handshake in a later commit.
+    /// SHA-256 pin of the server's public key as `sha256:<hex>`, enforced by
+    /// the crypto handshake: the daemon refuses to start on a mismatch.
     pub server_key_pin: String,
+    /// Reconnect and keepalive knobs.
+    #[serde(default)]
+    pub reconnect: ReconnectConfig,
+}
+
+impl fmt::Debug for MiniserverConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MiniserverConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("server_key_pin", &self.server_key_pin)
+            .field("reconnect", &self.reconnect)
+            .finish()
+    }
+}
+
+/// The full daemon configuration.
+///
+/// Both connection sections redact their own passwords in [`fmt::Debug`], so a
+/// derived one on the whole config stays safe to log.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Config {
+    /// Miniserver connection settings.
+    pub miniserver: MiniserverConfig,
     /// TimescaleDB connection. Its presence selects the Timescale sink;
     /// without it, readings go to the debug sink.
     #[serde(default)]
@@ -96,9 +123,6 @@ pub struct Config {
     /// Fallback log level when `RUST_LOG` is unset.
     #[serde(default = "default_log_level")]
     pub log_level: String,
-    /// Reconnect and keepalive knobs.
-    #[serde(default)]
-    pub reconnect: ReconnectConfig,
 }
 
 impl Config {
@@ -112,21 +136,6 @@ impl Config {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
         Self::from_yaml_str(&text)
-    }
-}
-
-impl fmt::Debug for Config {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Config")
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("user", &self.user)
-            .field("password", &"<redacted>")
-            .field("server_key_pin", &self.server_key_pin)
-            .field("timescale", &self.timescale)
-            .field("log_level", &self.log_level)
-            .field("reconnect", &self.reconnect)
-            .finish()
     }
 }
 
@@ -161,58 +170,62 @@ mod tests {
     #[test]
     fn parses_full_config() {
         let yaml = r#"
-host: miniserver.example
-port: 8080
-user: logger
-password: s3cret
-server_key_pin: "sha256:deadbeef"
+miniserver:
+  host: miniserver.example
+  port: 8080
+  user: logger
+  password: s3cret
+  server_key_pin: "sha256:deadbeef"
+  reconnect:
+    backoff_base_secs: 5
+    backoff_max_secs: 120
+    keepalive_secs: 200
 log_level: debug
-reconnect:
-  backoff_base_secs: 5
-  backoff_max_secs: 120
-  keepalive_secs: 200
 "#;
         let cfg = Config::from_yaml_str(yaml).unwrap();
-        assert_eq!(cfg.host, "miniserver.example");
-        assert_eq!(cfg.port, 8080);
-        assert_eq!(cfg.user, "logger");
-        assert_eq!(cfg.password, "s3cret");
-        assert_eq!(cfg.server_key_pin, "sha256:deadbeef");
+        assert_eq!(cfg.miniserver.host, "miniserver.example");
+        assert_eq!(cfg.miniserver.port, 8080);
+        assert_eq!(cfg.miniserver.user, "logger");
+        assert_eq!(cfg.miniserver.password, "s3cret");
+        assert_eq!(cfg.miniserver.server_key_pin, "sha256:deadbeef");
         assert!(cfg.timescale.is_none());
         assert_eq!(cfg.log_level, "debug");
-        assert_eq!(cfg.reconnect.backoff_base_secs, 5);
-        assert_eq!(cfg.reconnect.backoff_max_secs, 120);
-        assert_eq!(cfg.reconnect.keepalive_secs, 200);
+        assert_eq!(cfg.miniserver.reconnect.backoff_base_secs, 5);
+        assert_eq!(cfg.miniserver.reconnect.backoff_max_secs, 120);
+        assert_eq!(cfg.miniserver.reconnect.keepalive_secs, 200);
     }
 
     #[test]
     fn applies_defaults_for_optional_knobs() {
         let yaml = r#"
-host: miniserver.example
-user: logger
-password: s3cret
-server_key_pin: "sha256:deadbeef"
+miniserver:
+  host: miniserver.example
+  user: logger
+  password: s3cret
+  server_key_pin: "sha256:deadbeef"
 "#;
         let cfg = Config::from_yaml_str(yaml).unwrap();
-        assert_eq!(cfg.port, 80);
+        assert_eq!(cfg.miniserver.port, 80);
         assert!(cfg.timescale.is_none());
         assert_eq!(cfg.log_level, "info");
-        assert_eq!(cfg.reconnect.backoff_base_secs, 2);
-        assert_eq!(cfg.reconnect.backoff_max_secs, 300);
-        assert_eq!(cfg.reconnect.keepalive_secs, 240);
+        assert_eq!(cfg.miniserver.reconnect.backoff_base_secs, 2);
+        assert_eq!(cfg.miniserver.reconnect.backoff_max_secs, 300);
+        assert_eq!(cfg.miniserver.reconnect.keepalive_secs, 240);
     }
 
     #[test]
     fn debug_redacts_password() {
         let cfg = Config {
-            host: "miniserver.example".to_owned(),
-            port: 80,
-            user: "logger".to_owned(),
-            password: "s3cret".to_owned(),
-            server_key_pin: "sha256:deadbeef".to_owned(),
+            miniserver: MiniserverConfig {
+                host: "miniserver.example".to_owned(),
+                port: 80,
+                user: "logger".to_owned(),
+                password: "s3cret".to_owned(),
+                server_key_pin: "sha256:deadbeef".to_owned(),
+                reconnect: ReconnectConfig::default(),
+            },
             timescale: None,
             log_level: "info".to_owned(),
-            reconnect: ReconnectConfig::default(),
         };
         let rendered = format!("{cfg:?}");
         assert!(rendered.contains("<redacted>"));
@@ -222,10 +235,11 @@ server_key_pin: "sha256:deadbeef"
     #[test]
     fn parses_timescale_section_and_redacts_its_password() {
         let yaml = r#"
-host: miniserver.example
-user: logger
-password: s3cret
-server_key_pin: "sha256:deadbeef"
+miniserver:
+  host: miniserver.example
+  user: logger
+  password: s3cret
+  server_key_pin: "sha256:deadbeef"
 timescale:
   host: db.example
   port: 5433
@@ -251,10 +265,11 @@ timescale:
     #[test]
     fn timescale_port_defaults_to_5432() {
         let yaml = r#"
-host: miniserver.example
-user: logger
-password: s3cret
-server_key_pin: "sha256:deadbeef"
+miniserver:
+  host: miniserver.example
+  user: logger
+  password: s3cret
+  server_key_pin: "sha256:deadbeef"
 timescale:
   host: db.example
   user: loxtap

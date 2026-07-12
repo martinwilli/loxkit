@@ -191,7 +191,7 @@ pub async fn authenticate(
     identity: &ClientIdentity,
 ) -> Result<Token, AuthError> {
     // Step 1: getkey2 -> the per-user hashing key, salt and algorithm.
-    let cmd = format!("{CMD_GET_KEY2}{}", config.user);
+    let cmd = format!("{CMD_GET_KEY2}{}", config.miniserver.user);
     let resp = session.fenc_command(transport, &cmd).await?;
     if resp.code() != 200 {
         return Err(AuthError::GetKey2(resp.code()));
@@ -199,14 +199,14 @@ pub async fn authenticate(
     let challenge = KeyChallenge::from_reply(resp.value())?;
 
     // Step 2: derive the two hashes (different case rules, kept apart).
-    let pw_hash = password_hash(&config.password, &challenge.salt);
-    let auth_hash = auth_hash(&config.user, &pw_hash, &challenge.key);
+    let pw_hash = password_hash(&config.miniserver.password, &challenge.salt);
+    let auth_hash = auth_hash(&config.miniserver.user, &pw_hash, &challenge.key);
 
     // Step 3: getjwt -> the token. It must be sent encrypted or the server
     // declines it with 400, so it also rides fenc.
     let cmd = format!(
         "{CMD_GET_JWT}{auth_hash}/{}/{}/{}/{}",
-        config.user, TOKEN_PERMISSION, identity.uuid, identity.info,
+        config.miniserver.user, TOKEN_PERMISSION, identity.uuid, identity.info,
     );
     let resp = session.fenc_command(transport, &cmd).await?;
     if resp.code() != 200 {
@@ -263,7 +263,7 @@ pub async fn refresh_token(
 ) -> Result<Token, AuthError> {
     let key = fetch_token_key(session, transport).await?;
     let hash = token_hash(&key, token.token())?;
-    let cmd = format!("{CMD_REFRESH_JWT}{hash}/{}", config.user);
+    let cmd = format!("{CMD_REFRESH_JWT}{hash}/{}", config.miniserver.user);
     let resp = session.fenc_command(transport, &cmd).await?;
     match resp.code() {
         200 => Token::from_refresh_reply(resp.value(), token, SystemTime::now()),
