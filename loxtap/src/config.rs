@@ -10,17 +10,6 @@ use std::path::Path;
 use anyhow::Context as _;
 use serde::Deserialize;
 
-/// Which sink resolved readings are written to.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SinkKind {
-    /// Log each resolved reading via `tracing`; the only sink in Milestone 1.
-    #[default]
-    Debug,
-    /// Write into a TimescaleDB (Postgres) store; needs a `timescale:` section.
-    Timescale,
-}
-
 /// TimescaleDB (Postgres) connection parameters for the Timescale sink.
 ///
 /// The password is redacted from [`fmt::Debug`] just as the Miniserver one is,
@@ -104,10 +93,8 @@ pub struct Config {
     pub token_uuid: String,
     /// Human-readable client description sent alongside a token request.
     pub info: String,
-    /// Which sink to write into.
-    #[serde(default)]
-    pub sink: SinkKind,
-    /// TimescaleDB connection; required when `sink: timescale` is selected.
+    /// TimescaleDB connection. Its presence selects the Timescale sink;
+    /// without it, readings go to the debug sink.
     #[serde(default)]
     pub timescale: Option<TimescaleConfig>,
     /// Fallback log level when `RUST_LOG` is unset.
@@ -142,7 +129,6 @@ impl fmt::Debug for Config {
             .field("server_key_pin", &self.server_key_pin)
             .field("token_uuid", &self.token_uuid)
             .field("info", &self.info)
-            .field("sink", &self.sink)
             .field("timescale", &self.timescale)
             .field("log_level", &self.log_level)
             .field("reconnect", &self.reconnect)
@@ -188,7 +174,6 @@ password: s3cret
 server_key_pin: "sha256:deadbeef"
 token_uuid: 00000000-1111-2222-3333444455556666
 info: loxtap-test
-sink: debug
 log_level: debug
 reconnect:
   backoff_base_secs: 5
@@ -202,7 +187,7 @@ reconnect:
         assert_eq!(cfg.password, "s3cret");
         assert_eq!(cfg.server_key_pin, "sha256:deadbeef");
         assert_eq!(cfg.info, "loxtap-test");
-        assert_eq!(cfg.sink, SinkKind::Debug);
+        assert!(cfg.timescale.is_none());
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.reconnect.backoff_base_secs, 5);
         assert_eq!(cfg.reconnect.backoff_max_secs, 120);
@@ -221,7 +206,7 @@ info: loxtap-test
 "#;
         let cfg = Config::from_yaml_str(yaml).unwrap();
         assert_eq!(cfg.port, 80);
-        assert_eq!(cfg.sink, SinkKind::Debug);
+        assert!(cfg.timescale.is_none());
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.reconnect.backoff_base_secs, 2);
         assert_eq!(cfg.reconnect.backoff_max_secs, 300);
@@ -238,7 +223,6 @@ info: loxtap-test
             server_key_pin: "sha256:deadbeef".to_owned(),
             token_uuid: "00000000-1111-2222-3333444455556666".to_owned(),
             info: "loxtap-test".to_owned(),
-            sink: SinkKind::Debug,
             timescale: None,
             log_level: "info".to_owned(),
             reconnect: ReconnectConfig::default(),
@@ -257,7 +241,6 @@ password: s3cret
 server_key_pin: "sha256:deadbeef"
 token_uuid: 00000000-1111-2222-3333444455556666
 info: loxtap-test
-sink: timescale
 timescale:
   host: db.example
   port: 5433
@@ -266,7 +249,6 @@ timescale:
   dbname: loxtap
 "#;
         let cfg = Config::from_yaml_str(yaml).unwrap();
-        assert_eq!(cfg.sink, SinkKind::Timescale);
         let ts = cfg.timescale.expect("timescale section present");
         assert_eq!(ts.host, "db.example");
         assert_eq!(ts.port, 5433);

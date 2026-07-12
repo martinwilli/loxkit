@@ -15,7 +15,7 @@
 //! Milestone 1 ships only the [`debug`] sink; a later milestone plugs a real
 //! store in behind this same trait, additively.
 
-use crate::config::{Config, SinkKind};
+use crate::config::Config;
 use crate::model::{Reading, SeriesMeta};
 
 pub mod debug;
@@ -35,19 +35,15 @@ pub trait Sink: Send + Sync {
     async fn upsert_meta(&self, meta: &[SeriesMeta]) -> anyhow::Result<()>;
 }
 
-/// Construct the sink named by the config selector.
+/// Construct the sink implied by the config.
 ///
-/// The single seam the daemon uses to pick a backend. It is async and fallible
-/// because a real store connects (and runs its startup migrations) here, either
-/// of which can fail.
+/// The single seam the daemon uses to pick a backend: a `timescale:` section
+/// selects the TimescaleDB store, otherwise readings go to the debug sink. It is
+/// async and fallible because a real store connects (and runs its startup
+/// migrations) here, either of which can fail.
 pub async fn build(config: &Config) -> anyhow::Result<Box<dyn Sink>> {
-    match config.sink {
-        SinkKind::Debug => Ok(Box::new(debug::DebugSink::new())),
-        SinkKind::Timescale => {
-            let ts = config.timescale.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("sink 'timescale' selected but no 'timescale:' config section present")
-            })?;
-            Ok(Box::new(timescale::TimescaleSink::connect(ts).await?))
-        }
+    match config.timescale.as_ref() {
+        Some(ts) => Ok(Box::new(timescale::TimescaleSink::connect(ts).await?)),
+        None => Ok(Box::new(debug::DebugSink::new())),
     }
 }

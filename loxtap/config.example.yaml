@@ -18,10 +18,6 @@ server_key_pin: "sha256:00000000000000000000000000000000000000000000000000000000
 token_uuid: 00000000-0000-0000-0000000000000000
 info: loxtap
 
-# Where resolved readings go. "debug" logs each reading; "timescale" writes to
-# the TimescaleDB store configured below.
-sink: debug
-
 # Fallback log level when RUST_LOG is unset (error, warn, info, debug, trace).
 log_level: info
 
@@ -31,7 +27,8 @@ reconnect:
   backoff_max_secs: 300
   keepalive_secs: 240
 
-# TimescaleDB sink connection, used when sink: timescale above. Plain Postgres
+# TimescaleDB sink connection. Defining this section selects the TimescaleDB
+# sink; drop or comment it out to fall back to the debug sink. Plain Postgres
 # over a trusted LAN (no TLS). All values below are placeholders.
 timescale:
   host: timescale.example
