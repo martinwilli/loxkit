@@ -35,8 +35,9 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 use serde_json::Value;
+use tracing::debug;
 
-use crate::model::{LoxUuid, SeriesMeta};
+use crate::model::{AggMode, LoxUuid, SeriesMeta};
 use crate::transport::{Inbound, Transport, TransportError};
 
 /// Command that returns the structure file as a raw-JSON text frame.
@@ -79,6 +80,11 @@ pub struct StateEntry {
     /// `value` state only; other states (an `error` flag, status/enum states)
     /// carry none, since the format describes the value.
     pub unit: Option<String>,
+    /// How this series aggregates over time. Classified from a statistic
+    /// output's `visuType`; a series with no statistic output stays a gauge,
+    /// the safe default (time-weighting an instantaneous value is correct,
+    /// only a true monotonic counter needs delta treatment).
+    pub agg_mode: AggMode,
 }
 
 /// A parsed structure file: the flat uuid map plus its freshness stamp.
@@ -125,6 +131,7 @@ impl Structure {
             category: e.category.clone(),
             sub: e.sub.clone(),
             unit: e.unit.clone(),
+            agg_mode: e.agg_mode,
         })
     }
 
@@ -282,6 +289,11 @@ struct RawStatOutput {
     format: Option<String>,
     #[serde(default)]
     uuid: Option<String>,
+    /// Loxone's own gauge/counter tag: `0` = instantaneous gauge (e.g. kW),
+    /// `2` = monotonic counter (e.g. kWh). Absent or unknown maps to the gauge
+    /// default.
+    #[serde(rename = "visuType", default)]
+    visu_type: Option<i64>,
 }
 
 /// Invert one control's states into the flat map, then recurse into its
@@ -331,6 +343,10 @@ fn index_control(
                         category: category.clone(),
                         sub: sub.clone(),
                         unit: entry_unit.clone(),
+                        // A plain state carries no statistic output, so it is a
+                        // gauge; a visuType-2 output for the same uuid overwrites
+                        // this below and reclassifies it as a counter.
+                        agg_mode: AggMode::Gauge,
                     },
                 );
             }
@@ -363,6 +379,11 @@ fn index_control(
                     // sink renders one clean name rather than name/sub.
                     sub: output.name.clone(),
                     unit: output.format.as_deref().and_then(unit_from_format),
+                    // The output's visuType is Loxone's own gauge/counter signal.
+                    // Insert (not or_insert) means a visuType-2 output overwrites
+                    // any backing state entry, so a state-backed total classifies
+                    // as a counter.
+                    agg_mode: agg_mode_from_visu_type(output.visu_type),
                 },
             );
         }
@@ -388,6 +409,7 @@ fn index_control(
             sub: "action".to_owned(),
             // The action value carries no declared unit of its own.
             unit: None,
+            agg_mode: AggMode::Gauge,
         });
     }
 
@@ -419,6 +441,7 @@ fn index_flat_states(
                         category: None,
                         sub: name.clone(),
                         unit: None,
+                        agg_mode: AggMode::Gauge,
                     },
                 );
             }
@@ -433,6 +456,24 @@ fn state_uuids(value: &Value) -> Vec<&str> {
         Value::String(s) => vec![s.as_str()],
         Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Classify a statistic output's aggregation mode from its `visuType`.
+///
+/// Loxone tags each output `0` for an instantaneous gauge (e.g. kW) or `2` for a
+/// monotonic counter (e.g. kWh). An absent tag is the expected no-statistic case
+/// and stays a gauge silently; an unseen non-`{0,2}` value (none on the box
+/// today, but a future firmware might add one) also falls back to gauge, the safe
+/// default, and logs it so it surfaces.
+fn agg_mode_from_visu_type(visu_type: Option<i64>) -> AggMode {
+    match visu_type {
+        Some(0) | None => AggMode::Gauge,
+        Some(2) => AggMode::Counter,
+        Some(other) => {
+            debug!("unknown statistic visuType {other}, defaulting to gauge");
+            AggMode::Gauge
+        }
     }
 }
 
@@ -473,8 +514,10 @@ mod tests {
     // inherits its parent's room and category, the flat `globalStates`
     // block that lives outside `controls{}`, a Switch whose uuidAction is
     // one of its own state uuids (the action-fallback collision), and a
-    // Solar control with statistic outputs (one overlapping a state, one
-    // dedicated).
+    // Solar control with statistic outputs covering every aggregation-mode
+    // shape: a visuType-0 gauge output overlapping the prodCurr state, a
+    // dedicated visuType-2 counter (no backing state), and a state-backed
+    // visuType-2 counter overwriting the `total` state.
     const FIXTURE: &str = r#"{
       "lastModified": "2026-01-02 03:04:05",
       "rooms": {
@@ -534,11 +577,15 @@ mod tests {
           "uuidAction": "deadbeef-1111-0000-0000000000000004",
           "room": "deadbeef-0000-0000-0000000000000001",
           "cat": "deadbeef-0000-0000-0000000000000002",
-          "states": { "prodCurr": "deadbeef-6666-0000-0000000000000001" },
+          "states": {
+            "prodCurr": "deadbeef-6666-0000-0000000000000001",
+            "total": "deadbeef-6666-0000-0000000000000003"
+          },
           "statistic": {
             "outputs": [
-              { "id": 0, "name": "Leistung Produktion", "format": "%.3f kW", "uuid": "deadbeef-6666-0000-0000000000000001" },
-              { "id": 1, "name": "Zähler Produktion", "format": "%.3f kWh", "uuid": "deadbeef-6666-0000-0000000000000002" }
+              { "id": 0, "name": "Leistung Produktion", "format": "%.3f kW", "visuType": 0, "uuid": "deadbeef-6666-0000-0000000000000001" },
+              { "id": 1, "name": "Zähler Produktion", "format": "%.3f kWh", "visuType": 2, "uuid": "deadbeef-6666-0000-0000000000000002" },
+              { "id": 2, "name": "Zähler Verbrauch", "format": "%.3f kWh", "visuType": 2, "uuid": "deadbeef-6666-0000-0000000000000003" }
             ]
           }
         }
@@ -553,13 +600,13 @@ mod tests {
     fn parses_stamp_and_all_state_uuids() {
         let structure = Structure::parse(FIXTURE).unwrap();
         assert_eq!(structure.last_modified(), "2026-01-02 03:04:05");
-        // Seven state uuids (Temperature value + error, two Meter outputs, one
-        // subcontrol, one Switch, one Solar prodCurr), two globalStates, one
-        // statistic-only output (Solar's second; the first overwrites the
-        // prodCurr state, no new key), and four action fallbacks (Temperature,
-        // Meter, Sub Meter, Solar — the Switch action collides with its own
-        // state).
-        assert_eq!(structure.len(), 14);
+        // Eight state uuids (Temperature value + error, two Meter outputs, one
+        // subcontrol, one Switch, one Solar prodCurr, one Solar total), two
+        // globalStates, one statistic-only output (Solar's Zähler Produktion; the
+        // other two outputs overwrite the prodCurr and total states, no new key),
+        // and four action fallbacks (Temperature, Meter, Sub Meter, Solar — the
+        // Switch action collides with its own state).
+        assert_eq!(structure.len(), 15);
     }
 
     #[test]
@@ -589,6 +636,38 @@ mod tests {
         assert_eq!(entry.unit.as_deref(), Some("kW"));
         // sub mirrors the name so the sink renders one clean label, not name/sub.
         assert_eq!(entry.sub, "Leistung Produktion");
+    }
+
+    #[test]
+    fn classifies_aggregation_mode_from_visu_type() {
+        let structure = Structure::parse(FIXTURE).unwrap();
+
+        // A visuType-0 output (Leistung Produktion, kW) is a gauge, even though
+        // it overwrites the prodCurr state for the same uuid.
+        let gauge_out = uuid("deadbeef-6666-0000-0000000000000001");
+        assert_eq!(structure.resolve(&gauge_out).unwrap().agg_mode, AggMode::Gauge);
+        assert_eq!(structure.series_meta(&gauge_out).unwrap().agg_mode, AggMode::Gauge);
+
+        // A dedicated visuType-2 output (Zähler Produktion, no backing state) is
+        // a counter.
+        let dedicated = uuid("deadbeef-6666-0000-0000000000000002");
+        assert_eq!(structure.resolve(&dedicated).unwrap().agg_mode, AggMode::Counter);
+        assert_eq!(structure.series_meta(&dedicated).unwrap().agg_mode, AggMode::Counter);
+
+        // A state-backed visuType-2 output (Zähler Verbrauch shares the `total`
+        // state uuid): the state alone would default to gauge, but the output's
+        // insert overwrites it as a counter — the load-bearing overwrite.
+        let state_backed = uuid("deadbeef-6666-0000-0000000000000003");
+        assert_eq!(structure.resolve(&state_backed).unwrap().agg_mode, AggMode::Counter);
+        assert_eq!(
+            structure.series_meta(&state_backed).unwrap().agg_mode,
+            AggMode::Counter
+        );
+
+        // A plain state with no statistic output defaults to gauge.
+        let plain = uuid("deadbeef-2222-0000-0000000000000001");
+        assert_eq!(structure.resolve(&plain).unwrap().agg_mode, AggMode::Gauge);
+        assert_eq!(structure.series_meta(&plain).unwrap().agg_mode, AggMode::Gauge);
     }
 
     #[test]

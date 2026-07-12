@@ -83,6 +83,7 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     use super::*;
+    use crate::model::AggMode;
 
     fn reading(uuid: &str, value: f64) -> Reading {
         Reading {
@@ -101,6 +102,7 @@ mod tests {
             category: cat.map(str::to_owned),
             sub: sub.to_owned(),
             unit: unit.map(str::to_owned),
+            agg_mode: AggMode::default(),
         }
     }
 
