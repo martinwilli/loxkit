@@ -48,11 +48,16 @@ use crate::model::{LoxUuid, Reading, SeriesMeta};
 const RECONNECT_ATTEMPTS: usize = 3;
 const RECONNECT_DELAY: Duration = Duration::from_millis(200);
 
-/// The idempotent label upsert: insert the row, or update every label column on
-/// a uuid conflict. A rename is exactly this update, never a new series.
+/// The idempotent label upsert, batched: unnest the parallel arrays into rows,
+/// insert them, and update every label column on a uuid conflict. A rename is
+/// exactly this update, never a new series. Folding the whole set into one
+/// statement is what keeps learning a full state dump's labels a single
+/// round-trip rather than one (fsync-bound) transaction per series. The arrays
+/// bind as `uuid[]` and seven `text[]`; the caller collapses to one row per
+/// uuid so a repeated conflict key cannot error the statement.
 const UPSERT_META_SQL: &str = "\
 INSERT INTO series_meta (uuid, control, name, room, category, sub, unit, agg_mode) \
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+SELECT * FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[]) \
 ON CONFLICT (uuid) DO UPDATE SET \
     control = EXCLUDED.control, \
     name = EXCLUDED.name, \
@@ -287,35 +292,57 @@ impl Sink for TimescaleSink {
 
     async fn upsert_meta(&self, meta: &[SeriesMeta]) -> anyhow::Result<()> {
         // The event loop calls this on every value table, so drop any meta that
-        // matches what we last wrote for its uuid before touching the DB.
-        // SeriesMeta is PartialEq, so equality is direct. The std lock is never
-        // held across an await.
+        // matches what we last wrote for its uuid before touching the DB, and
+        // collapse to one row per uuid (last wins) so the batched statement
+        // below cannot hit a repeated conflict key. SeriesMeta is PartialEq, so
+        // equality is direct. The std lock is never held across an await.
         let changed: Vec<SeriesMeta> = {
             let cache = self.labels.lock().expect("labels lock poisoned");
-            meta.iter()
-                .filter(|m| cache.get(&m.uuid) != Some(*m))
-                .cloned()
-                .collect()
+            let mut latest: HashMap<LoxUuid, SeriesMeta> = HashMap::with_capacity(meta.len());
+            for m in meta {
+                if cache.get(&m.uuid) != Some(m) {
+                    latest.insert(m.uuid, m.clone());
+                }
+            }
+            latest.into_values().collect()
         };
         if changed.is_empty() {
             return Ok(());
         }
 
+        // Unzip into parallel arrays for one unnest upsert. This is the batch
+        // that makes a cold-cache dump learn every series' labels in a single
+        // round-trip; the per-row loop it replaced serialized a full state dump
+        // into one fsync-bound transaction per series and stalled the read loop.
+        let n = changed.len();
+        let mut uuids = Vec::with_capacity(n);
+        let mut controls: Vec<String> = Vec::with_capacity(n);
+        let mut names: Vec<String> = Vec::with_capacity(n);
+        let mut rooms: Vec<Option<String>> = Vec::with_capacity(n);
+        let mut categories: Vec<Option<String>> = Vec::with_capacity(n);
+        let mut subs: Vec<String> = Vec::with_capacity(n);
+        let mut units: Vec<Option<String>> = Vec::with_capacity(n);
+        let mut agg_modes: Vec<String> = Vec::with_capacity(n);
+        for m in &changed {
+            uuids.push(uuid::Uuid::from_bytes(*m.uuid.as_bytes()));
+            controls.push(m.control.clone());
+            names.push(m.name.clone());
+            rooms.push(m.room.clone());
+            categories.push(m.category.clone());
+            subs.push(m.sub.clone());
+            units.push(m.unit.clone());
+            agg_modes.push(m.agg_mode.as_str().to_owned());
+        }
+
         let mut client = self.client.lock().await;
         self.ensure_connected(&mut client).await?;
-        // Per-row execution is fine: labels change rarely and the batch is one
-        // table's worth of series.
-        for m in &changed {
-            let id = uuid::Uuid::from_bytes(*m.uuid.as_bytes());
-            let agg = m.agg_mode.as_str();
-            client
-                .execute(
-                    UPSERT_META_SQL,
-                    &[&id, &m.control, &m.name, &m.room, &m.category, &m.sub, &m.unit, &agg],
-                )
-                .await
-                .context("upserting series_meta")?;
-        }
+        client
+            .execute(
+                UPSERT_META_SQL,
+                &[&uuids, &controls, &names, &rooms, &categories, &subs, &units, &agg_modes],
+            )
+            .await
+            .context("upserting series_meta")?;
         drop(client);
 
         let mut cache = self.labels.lock().expect("labels lock poisoned");
