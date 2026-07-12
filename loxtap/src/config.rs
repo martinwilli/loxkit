@@ -89,10 +89,6 @@ pub struct Config {
     /// Present here from the start, but only *enforced* by the crypto
     /// handshake in a later commit.
     pub server_key_pin: String,
-    /// Stable client id under which the server tracks tokens we were issued.
-    pub token_uuid: String,
-    /// Human-readable client description sent alongside a token request.
-    pub info: String,
     /// TimescaleDB connection. Its presence selects the Timescale sink;
     /// without it, readings go to the debug sink.
     #[serde(default)]
@@ -127,8 +123,6 @@ impl fmt::Debug for Config {
             .field("user", &self.user)
             .field("password", &"<redacted>")
             .field("server_key_pin", &self.server_key_pin)
-            .field("token_uuid", &self.token_uuid)
-            .field("info", &self.info)
             .field("timescale", &self.timescale)
             .field("log_level", &self.log_level)
             .field("reconnect", &self.reconnect)
@@ -172,8 +166,6 @@ port: 8080
 user: logger
 password: s3cret
 server_key_pin: "sha256:deadbeef"
-token_uuid: 00000000-1111-2222-3333444455556666
-info: loxtap-test
 log_level: debug
 reconnect:
   backoff_base_secs: 5
@@ -186,7 +178,6 @@ reconnect:
         assert_eq!(cfg.user, "logger");
         assert_eq!(cfg.password, "s3cret");
         assert_eq!(cfg.server_key_pin, "sha256:deadbeef");
-        assert_eq!(cfg.info, "loxtap-test");
         assert!(cfg.timescale.is_none());
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.reconnect.backoff_base_secs, 5);
@@ -201,8 +192,6 @@ host: miniserver.example
 user: logger
 password: s3cret
 server_key_pin: "sha256:deadbeef"
-token_uuid: 00000000-1111-2222-3333444455556666
-info: loxtap-test
 "#;
         let cfg = Config::from_yaml_str(yaml).unwrap();
         assert_eq!(cfg.port, 80);
@@ -221,8 +210,6 @@ info: loxtap-test
             user: "logger".to_owned(),
             password: "s3cret".to_owned(),
             server_key_pin: "sha256:deadbeef".to_owned(),
-            token_uuid: "00000000-1111-2222-3333444455556666".to_owned(),
-            info: "loxtap-test".to_owned(),
             timescale: None,
             log_level: "info".to_owned(),
             reconnect: ReconnectConfig::default(),
@@ -239,8 +226,6 @@ host: miniserver.example
 user: logger
 password: s3cret
 server_key_pin: "sha256:deadbeef"
-token_uuid: 00000000-1111-2222-3333444455556666
-info: loxtap-test
 timescale:
   host: db.example
   port: 5433
@@ -270,8 +255,6 @@ host: miniserver.example
 user: logger
 password: s3cret
 server_key_pin: "sha256:deadbeef"
-token_uuid: 00000000-1111-2222-3333444455556666
-info: loxtap-test
 timescale:
   host: db.example
   user: loxtap

@@ -10,6 +10,7 @@ pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod events;
+pub mod identity;
 pub mod migrate;
 pub mod model;
 pub mod sink;

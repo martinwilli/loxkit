@@ -13,10 +13,8 @@ password: password
 # Enforced by the crypto handshake: the daemon refuses to start on a mismatch.
 server_key_pin: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
-# Stable client id under which the Miniserver tracks tokens issued to us.
-# Generate once (any uuid), then keep it fixed.
-token_uuid: 00000000-0000-0000-0000000000000000
-info: loxtap
+# The client id the server tracks tokens under, and its device-list label, are
+# derived from the host (machine-id and hostname), so nothing goes here.
 
 # Fallback log level when RUST_LOG is unset (error, warn, info, debug, trace).
 log_level: info

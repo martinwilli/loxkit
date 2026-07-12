@@ -47,6 +47,7 @@ use crate::auth::{self, AuthError, Token, authenticate};
 use crate::config::Config;
 use crate::crypto::{CryptoError, Session, handshake};
 use crate::events;
+use crate::identity::ClientIdentity;
 use crate::sink::{self, Sink};
 use crate::structure::{Structure, fetch_structure};
 use crate::transport::{Inbound, Transport, TransportError};
@@ -92,6 +93,9 @@ type Established = (Transport, Session, Token, Structure);
 /// Returns `Ok` on a clean shutdown and `Err` on a terminal condition a human
 /// must resolve (a pin mismatch, bad credentials, or unsupported firmware).
 pub async fn run(config: &Config) -> anyhow::Result<()> {
+    // The client identity is derived from the host, not configured; resolve it
+    // once up front so a missing machine-id is a clean startup error.
+    let identity = ClientIdentity::resolve()?;
     let sink = sink::build(config).await?;
     let mut shutdown = install_shutdown();
     let base = Duration::from_secs(config.reconnect.backoff_base_secs);
@@ -100,7 +104,7 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
     let mut attempt: u32 = 0;
 
     loop {
-        match connect_and_run(config, sink.as_ref(), &mut shutdown, &mut attempt).await {
+        match connect_and_run(config, &identity, sink.as_ref(), &mut shutdown, &mut attempt).await {
             SessionOutcome::Shutdown => {
                 info!("shutdown complete");
                 return Ok(());
@@ -143,6 +147,7 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
 /// Stand up one session, then run it until it ends.
 async fn connect_and_run(
     config: &Config,
+    identity: &ClientIdentity,
     sink: &dyn Sink,
     shutdown: &mut watch::Receiver<bool>,
     attempt: &mut u32,
@@ -153,7 +158,7 @@ async fn connect_and_run(
     let established = tokio::select! {
         biased;
         _ = shutdown_requested(shutdown) => return SessionOutcome::Shutdown,
-        result = establish(config) => result,
+        result = establish(config, identity) => result,
     };
     let (mut transport, mut session, mut token, structure) = match established {
         Ok(v) => v,
@@ -173,13 +178,17 @@ async fn connect_and_run(
         &structure,
         sink,
         config,
+        identity,
         shutdown,
     )
     .await
 }
 
 /// Connect, verify the pin, authenticate, and load the structure map.
-async fn establish(config: &Config) -> Result<Established, SessionOutcome> {
+async fn establish(
+    config: &Config,
+    identity: &ClientIdentity,
+) -> Result<Established, SessionOutcome> {
     let mut transport = Transport::connect(&config.host, config.port)
         .await
         .map_err(|e| retryable("connect", e))?;
@@ -196,7 +205,7 @@ async fn establish(config: &Config) -> Result<Established, SessionOutcome> {
         Err(CryptoError::Pin(pe)) => return Err(SessionOutcome::Terminal(pe.into())),
         Err(e) => return Err(retryable("handshake", e)),
     };
-    let token = match authenticate(&mut session, &mut transport, config).await {
+    let token = match authenticate(&mut session, &mut transport, config, identity).await {
         Ok(t) => t,
         Err(e) if is_terminal_auth(&e) => return Err(SessionOutcome::Terminal(e.into())),
         Err(e) => return Err(retryable("authentication", e)),
@@ -208,6 +217,10 @@ async fn establish(config: &Config) -> Result<Established, SessionOutcome> {
 }
 
 /// Enable the event stream and pump it, keeping the session alive.
+///
+/// It coordinates the whole live session (transport, session, token, sink,
+/// timers), so the parameter list is unavoidably wide.
+#[allow(clippy::too_many_arguments)]
 async fn event_loop(
     transport: &mut Transport,
     session: &mut Session,
@@ -215,6 +228,7 @@ async fn event_loop(
     structure: &Structure,
     sink: &dyn Sink,
     config: &Config,
+    identity: &ClientIdentity,
     shutdown: &mut watch::Receiver<bool>,
 ) -> SessionOutcome {
     if let Err(e) = events::enable_updates(transport).await {
@@ -247,7 +261,7 @@ async fn event_loop(
         }
         if refresh_due {
             refresh_due = false;
-            match auth::refresh_token(session, transport, token, config).await {
+            match auth::refresh_token(session, transport, token, config, identity).await {
                 Ok(new) => {
                     *token = new;
                     let delay = refresh_deadline(token, REFRESH_CAP, SystemTime::now());

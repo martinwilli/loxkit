@@ -38,6 +38,7 @@ use tracing::warn;
 
 use crate::config::Config;
 use crate::crypto::{CryptoError, Session};
+use crate::identity::ClientIdentity;
 use crate::transport::{Transport, TransportError};
 
 /// Command prefix that returns the per-user hashing key, salt and algorithm.
@@ -187,6 +188,7 @@ pub async fn authenticate(
     session: &mut Session,
     transport: &mut Transport,
     config: &Config,
+    identity: &ClientIdentity,
 ) -> Result<Token, AuthError> {
     // Step 1: getkey2 -> the per-user hashing key, salt and algorithm.
     let cmd = format!("{CMD_GET_KEY2}{}", config.user);
@@ -204,7 +206,7 @@ pub async fn authenticate(
     // declines it with 400, so it also rides fenc.
     let cmd = format!(
         "{CMD_GET_JWT}{auth_hash}/{}/{}/{}/{}",
-        config.user, TOKEN_PERMISSION, config.token_uuid, config.info,
+        config.user, TOKEN_PERMISSION, identity.uuid, identity.info,
     );
     let resp = session.fenc_command(transport, &cmd).await?;
     if resp.code() != 200 {
@@ -257,6 +259,7 @@ pub async fn refresh_token(
     transport: &mut Transport,
     token: &Token,
     config: &Config,
+    identity: &ClientIdentity,
 ) -> Result<Token, AuthError> {
     let key = fetch_token_key(session, transport).await?;
     let hash = token_hash(&key, token.token())?;
@@ -266,7 +269,7 @@ pub async fn refresh_token(
         200 => Token::from_refresh_reply(resp.value(), token, SystemTime::now()),
         477 => {
             warn!("token expired before refresh, re-authenticating from scratch");
-            authenticate(session, transport, config).await
+            authenticate(session, transport, config, identity).await
         }
         c => Err(AuthError::RefreshJwt(c)),
     }
