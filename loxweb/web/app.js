@@ -546,7 +546,9 @@
       var cfgUnit = (panel.axes && panel.axes[yIdx] && panel.axes[yIdx].unit) || "";
       var dbUnit = (dbUnits && dbUnits[i]) || "";
       seriesUnits[i] = cfgUnit || dbUnit;
-      if (dbUnit && axisStoreUnit[yIdx] === undefined) {
+      // A hidden series is never drawn, so its unit must not become an axis's
+      // fallback label (a hidden kWh counter would mislabel a kW/°C axis).
+      if (dbUnit && !s.hidden && axisStoreUnit[yIdx] === undefined) {
         axisStoreUnit[yIdx] = dbUnit;
       }
     });
@@ -584,9 +586,22 @@
     }
 
     var legend = [];
-    var series = panel.series.map(function (s, i) {
+    // drawnUnits parallels the ECharts series array (hidden series omitted), so
+    // the tooltip can index it by seriesIndex; seriesUnits is keyed by the full
+    // panel.series index and would drift once a hidden series is skipped.
+    var drawnUnits = [];
+    var series = [];
+    panel.series.forEach(function (s, i) {
+      // A hidden series is computed for expr references (buildPanelSeriesData
+      // still registers its data by id) but never drawn: no legend, no chart
+      // series. Skipping it here is what keeps drawnUnits aligned with the
+      // ECharts series index.
+      if (s.hidden) {
+        return;
+      }
       var label = s.label || s.id || "series " + (i + 1);
       legend.push(label);
+      drawnUnits.push(seriesUnits[i]);
       var color = s.color || palette[i % palette.length];
       var yIdx = seriesAxis[i];
       var opt = {
@@ -627,7 +642,7 @@
         opt.barCategoryGap = "10%";
         opt.barGap = "10%";
       }
-      return opt;
+      series.push(opt);
     });
 
     return {
@@ -661,7 +676,7 @@
               text = "-";
             } else {
               text = typeof v === "number" ? String(Number(v.toFixed(3))) : String(v);
-              var unit = seriesUnits[p.seriesIndex];
+              var unit = drawnUnits[p.seriesIndex];
               if (unit) {
                 text += " " + unit;
               }

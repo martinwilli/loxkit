@@ -124,6 +124,12 @@ pub struct Series {
     /// Fill the area under a line.
     #[serde(default)]
     pub fill: bool,
+    /// Computed for `expr` references but never drawn — no legend entry, no
+    /// plotted line/bars. For a bound input a derived sibling needs that has no
+    /// place on the panel itself (a raw counter feeding a ratio, say). Requires
+    /// an `id`, since a hidden series is pointless unless something references it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
     /// Stack group; series sharing a group stack together.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack: Option<String>,
@@ -305,6 +311,13 @@ fn validate_panel(view: &View, panel: &Panel) -> anyhow::Result<()> {
                 }
             }
             (true, false) => {}
+        }
+
+        if series.hidden && series.id.is_none() {
+            bail!(
+                "{}: {sref} is hidden but has no id; a hidden series is only useful if a sibling expr references it",
+                loc(view, panel)
+            );
         }
 
         if let Some(id) = &series.id
@@ -871,6 +884,43 @@ views:
         let err = DashboardStore::parse_and_validate(yaml).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("neither uuid nor expr"), "message was: {msg}");
+    }
+
+    #[test]
+    fn parses_a_hidden_input_series() {
+        // A hidden bound counter feeds a derived sibling but is not drawn; the
+        // derived series that references it is visible as usual.
+        let yaml = r#"
+views:
+  - id: v
+    title: V
+    panels:
+      - title: P
+        series:
+          - {id: a, uuid: "deadbeef-0000-0000-0000-000000000001", agg: delta, hidden: true}
+          - {label: R, expr: "a / 2"}
+"#;
+        let dbs = DashboardStore::parse_and_validate(yaml).unwrap();
+        assert!(dbs.views[0].panels[0].series[0].hidden);
+        assert!(!dbs.views[0].panels[0].series[1].hidden);
+    }
+
+    #[test]
+    fn rejects_a_hidden_series_without_id() {
+        // Hidden and unreferenceable is a dead series; reject it so the mistake
+        // surfaces at load rather than silently drawing nothing.
+        let yaml = r#"
+views:
+  - id: v
+    title: V
+    panels:
+      - title: P
+        series:
+          - {uuid: "deadbeef-0000-0000-0000-000000000001", hidden: true}
+"#;
+        let err = DashboardStore::parse_and_validate(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("hidden but has no id"), "message was: {msg}");
     }
 
     #[test]
