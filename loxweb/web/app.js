@@ -520,7 +520,7 @@
 
   var INTERP = { linear: {}, smooth: { smooth: true }, step: { step: "end" } };
 
-  function buildPanelOption(panel, seriesData, viewWin, padWin, dbUnits) {
+  function buildPanelOption(panel, seriesData, viewWin, padWin, dbUnits, animate) {
     var theme = themeName();
     var chrome = CHROME[theme];
     var palette = PALETTE[theme];
@@ -626,6 +626,10 @@
     });
 
     return {
+      // Animate the first paint, but snap data updates (zoom requery, refresh)
+      // instantly -- a transition there just slides the graph around before it
+      // settles on the new window.
+      animation: animate,
       backgroundColor: "transparent",
       textStyle: { color: chrome.ink2, fontFamily: "system-ui, -apple-system, sans-serif" },
       grid: { left: 56, right: 56, top: 36, bottom: 44, containLabel: true },
@@ -771,12 +775,14 @@
           return r ? r.unit : null;
         });
         var seriesData = buildPanelSeriesData(panel.series, boundPoints);
+        var animate = !chart.__painted;
+        chart.__painted = true;
         // Remember the extent we pinned the axis to, so onZoom can resolve a
         // zoom's percentages against the window actually on screen (a burst of
         // ticks all map against this, not against the drifting state.range).
         chart.__padWin = padWin;
         suppressZoom = true;
-        chart.setOption(buildPanelOption(panel, seriesData, win, padWin, dbUnits), {
+        chart.setOption(buildPanelOption(panel, seriesData, win, padWin, dbUnits, animate), {
           notMerge: true,
         });
         setTimeout(function () {
