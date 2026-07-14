@@ -221,6 +221,7 @@ fn resolve_request(
         uuid,
         sub: series_ref.resolved_sub().to_owned(),
         agg: series_ref.agg,
+        gapfill: series_ref.gapfill,
         from: ms_to_systemtime(from_ms),
         to: ms_to_systemtime(to_ms),
         bucket: panel_ref.bucket.or(view.bucket),

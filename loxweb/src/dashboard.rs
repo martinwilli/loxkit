@@ -143,6 +143,12 @@ pub struct Series {
     /// `series_meta.agg_mode` (commit 3), so no default is imposed here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agg: Option<Agg>,
+    /// Bound series: how an empty bucket is filled on the shared query grid —
+    /// carry the last value (`locf`), linearly `interpolate`, or leave it empty
+    /// (`none`, read as 0). Absent defaults to `none`; a signal that should carry
+    /// or ramp across gaps (a temperature, a level) opts into `locf`/`interpolate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gapfill: Option<Gapfill>,
     /// Derived series: an arithmetic expression over sibling series ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expr: Option<String>,
@@ -216,6 +222,25 @@ pub enum Agg {
     Integral,
 }
 
+/// How an empty bucket gets a value on the shared query grid. Every bound series
+/// is bucketed onto the same dense grid so a panel's stack lines up index-for-
+/// index; this picks what fills the empties. Absent on a series defaults to
+/// `None` (no fill); `locf`/`interpolate` are explicit opt-ins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Gapfill {
+    /// Carry the last observed value forward (a zero-order hold); for a level
+    /// that genuinely holds between samples, like a temperature or a setpoint.
+    /// (An on-change power meter that goes quiet at zero wants `None`, not this.)
+    Locf,
+    /// Linearly interpolate between the surrounding points (a first-order hold);
+    /// for a smoothly-varying, coarsely-sampled signal like a forecast.
+    Interpolate,
+    /// No fill (the default): an empty bucket stays empty and reads as 0. Right
+    /// for an accumulation, or an on-change meter that goes quiet at zero.
+    None,
+}
+
 fn default_scale() -> f64 {
     1.0
 }
@@ -269,9 +294,9 @@ fn validate_panel(view: &View, panel: &Panel) -> anyhow::Result<()> {
                 loc(view, panel)
             ),
             (false, true) => {
-                if series.sub.is_some() || series.agg.is_some() {
+                if series.sub.is_some() || series.agg.is_some() || series.gapfill.is_some() {
                     bail!(
-                        "{}: derived {sref} must not carry sub/agg (those apply only to a bound uuid series)",
+                        "{}: derived {sref} must not carry sub/agg/gapfill (those apply only to a bound uuid series)",
                         loc(view, panel)
                     );
                 }
@@ -795,6 +820,25 @@ views:
     }
 
     #[test]
+    fn rejects_a_derived_series_carrying_gapfill() {
+        // gapfill applies to a bound uuid query; a derived series is computed
+        // client-side and must not carry it (same rule as sub/agg).
+        let yaml = r#"
+views:
+  - id: v
+    title: V
+    panels:
+      - title: P
+        series:
+          - {id: a, uuid: "deadbeef-0000-0000-0000-000000000001"}
+          - {label: D, expr: "a + 1", gapfill: locf}
+"#;
+        let err = DashboardStore::parse_and_validate(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("must not carry sub/agg/gapfill"), "message was: {msg}");
+    }
+
+    #[test]
     fn rejects_a_series_with_both_uuid_and_expr() {
         let yaml = r#"
 views:
@@ -910,6 +954,10 @@ views:
         let climate = &dbs.views[0].panels[0];
         assert_eq!(climate.axes.len(), 3);
         assert!(climate.series.iter().any(|s| s.expr.is_some()));
+
+        // Outdoor temp opts into interpolate gapfill; the others take the default.
+        assert_eq!(climate.series[1].gapfill, Some(Gapfill::Interpolate));
+        assert_eq!(climate.series[0].gapfill, None);
 
         // The second view buckets real calendar months.
         assert_eq!(dbs.views[1].bucket, Some(Bucket::Month));

@@ -19,7 +19,8 @@
 //!   user input.
 //! * [`query_series`] is the DB-touching path: it resolves an absent `agg` from
 //!   `series_meta.agg_mode`, builds the SQL, runs it on loxweb's own read pool,
-//!   and maps rows to [`Point`]s (skipping empty/NULL buckets — no gapfill).
+//!   and maps rows to [`Point`]s. Every series is gapfilled onto the same grid
+//!   ([`build_sql`]), so a panel's stacked series align index-for-index.
 //!
 //! ## Tier routing
 //!
@@ -51,7 +52,7 @@ use uuid::Uuid;
 
 use loxtap::config::TimescaleConfig;
 
-use crate::dashboard::{Agg, Bucket};
+use crate::dashboard::{Agg, Bucket, Gapfill};
 
 /// Target number of buckets across any span; the router snaps to whatever nice
 /// ladder step comes closest to `span / TARGET_BUCKETS`, so a 1-hour and a
@@ -107,6 +108,10 @@ pub struct SeriesRequest {
     /// The aggregation. `None` means "resolve from `series_meta.agg_mode`" at
     /// query time (gauge → avg, counter → delta).
     pub agg: Option<Agg>,
+    /// How empty buckets fill on the shared grid. `None` means no fill
+    /// (`Gapfill::None`): an empty bucket reads as 0. A series carries or ramps
+    /// across gaps only by opting into `locf`/`interpolate`.
+    pub gapfill: Option<Gapfill>,
     /// Inclusive start of the window.
     pub from: SystemTime,
     /// Exclusive end of the window.
@@ -229,15 +234,25 @@ fn value_expr(agg: Agg, tier: Tier) -> &'static str {
 }
 
 /// Build the parametrized SQL for a request. **Pure and DB-free**: the returned
-/// string is a deterministic function of `(agg, span, bucket)`. The uuid and the
-/// two time bounds bind as `$1`/`$2`/`$3` in that order; everything else is
-/// chosen from the enums/ladders and safely inlined.
-fn build_sql(agg: Agg, from: SystemTime, to: SystemTime, bucket: Option<Bucket>) -> String {
+/// string is a deterministic function of `(agg, gapfill, span, bucket)`. The uuid
+/// and the two time bounds bind as `$1`/`$2`/`$3` in that order; everything else
+/// is chosen from the enums/ladders and safely inlined.
+fn build_sql(
+    agg: Agg,
+    gapfill: Gapfill,
+    from: SystemTime,
+    to: SystemTime,
+    bucket: Option<Bucket>,
+) -> String {
     // A reversed range degenerates to a zero span (finest bucket, empty result).
     let span_secs = to.duration_since(from).map(|d| d.as_secs()).unwrap_or(0);
 
+    // Every query gapfills onto a fixed grid spanning [$2, $3): a dashboard
+    // panel stacks series index-for-index, so they must share the same bucket
+    // set. Emitting only non-empty buckets (different per series) is what breaks
+    // a stack, so gapfill densifies each series to the identical grid.
     let (tier, bucket_expr) = if bucket == Some(Bucket::Month) {
-        // Calendar months: tz-aware 3-arg time_bucket, from readings_1h for the
+        // Calendar months: tz-aware time_bucket_gapfill, from readings_1h for the
         // plain aggs + integral, from raw for the raw-only aggs.
         let tier = if is_raw_only(agg) {
             Tier::Raw
@@ -245,16 +260,32 @@ fn build_sql(agg: Agg, from: SystemTime, to: SystemTime, bucket: Option<Bucket>)
             Tier::Hour
         };
         let tcol = tier.tcol();
-        let expr = format!("time_bucket('1 month', {tcol}, current_setting('TimeZone'))");
+        // The `::timestamptz` casts pin the bind types: time_bucket_gapfill is
+        // overloaded, so an un-cast $2/$3 leaves the param type unresolved (it
+        // defaults to text and breaks the `tcol >= $2` comparison).
+        let expr = format!(
+            "time_bucket_gapfill('1 month', {tcol}, current_setting('TimeZone'), \
+             $2::timestamptz, $3::timestamptz)"
+        );
         (tier, expr)
     } else {
         let (tier, interval) = route(agg, span_secs);
         let tcol = tier.tcol();
-        let expr = format!("time_bucket('{interval}', {tcol})");
+        let expr =
+            format!("time_bucket_gapfill('{interval}', {tcol}, $2::timestamptz, $3::timestamptz)");
         (tier, expr)
     };
 
-    let value = value_expr(agg, tier);
+    // Fill an empty bucket per the resolved mode: locf carries the last level,
+    // interpolate ramps between points, none leaves it NULL (coalesced to 0 when
+    // rows are mapped). locf/interpolate must be the top-level call, so any
+    // residual NULL→0 coalesce happens in Rust, not SQL.
+    let base = value_expr(agg, tier);
+    let value = match gapfill {
+        Gapfill::Locf => format!("locf({base})"),
+        Gapfill::Interpolate => format!("interpolate({base})"),
+        Gapfill::None => base.to_owned(),
+    };
     let table = tier.table();
     let tcol = tier.tcol();
     format!(
@@ -304,14 +335,16 @@ async fn resolve_agg(client: &deadpool_postgres::Client, uuid: Uuid) -> Result<A
 }
 
 /// Resolve the aggregation (if absent), build the tier-routed SQL, run it, and
-/// map rows to points. Empty/NULL buckets are skipped — no gapfill.
+/// map rows to points. Gapfill emits one row per bucket; an empty bucket's NULL
+/// coalesces to 0, so every series comes back on the identical dense grid.
 pub async fn query_series(pool: &Pool, req: &SeriesRequest) -> Result<Vec<Point>> {
     let client = pool.get().await.context("getting a read connection")?;
     let agg = match req.agg {
         Some(agg) => agg,
         None => resolve_agg(&client, req.uuid).await?,
     };
-    let sql = build_sql(agg, req.from, req.to, req.bucket);
+    let gapfill = req.gapfill.unwrap_or(Gapfill::None);
+    let sql = build_sql(agg, gapfill, req.from, req.to, req.bucket);
     let rows = client
         .query(&sql, &[&req.uuid, &req.from, &req.to])
         .await
@@ -319,11 +352,12 @@ pub async fn query_series(pool: &Pool, req: &SeriesRequest) -> Result<Vec<Point>
     let mut points = Vec::with_capacity(rows.len());
     for row in rows {
         let t: SystemTime = row.get(0);
-        // A finalized aggregate can be NULL (an empty or single-point bucket);
-        // skip it rather than gapfill.
-        if let Some(v) = row.get::<_, Option<f64>>(1) {
-            points.push(Point { t, v });
-        }
+        // Gapfill emits a row for every bucket in the window; an empty one is
+        // NULL (a leading gap before the first sample, or an accumulation gap).
+        // Coalesce to 0 so every series returns the identical dense grid and a
+        // panel's stack aligns index-for-index.
+        let v = row.get::<_, Option<f64>>(1).unwrap_or(0.0);
+        points.push(Point { t, v });
     }
     Ok(points)
 }
@@ -338,9 +372,17 @@ mod tests {
         UNIX_EPOCH + Duration::from_secs(secs)
     }
 
-    /// SQL for a span of `span_secs`, span-routed (no calendar bucket).
+    /// SQL for a span of `span_secs`, span-routed (no calendar bucket). Passes
+    /// `Gapfill::None` (the default) so these assert the bare per-tier aggregate;
+    /// the `locf`/`interpolate` wrappers have their own tests below.
     fn sql_for_span(agg: Agg, span_secs: u64) -> String {
-        build_sql(agg, t(1_600_000_000), t(1_600_000_000 + span_secs), None)
+        build_sql(
+            agg,
+            Gapfill::None,
+            t(1_600_000_000),
+            t(1_600_000_000 + span_secs),
+            None,
+        )
     }
 
     // --- one query per agg class on the raw tier (a 1-hour span → 10s) ---
@@ -349,7 +391,7 @@ mod tests {
     fn avg_on_raw_is_a_plain_mean() {
         assert_eq!(
             sql_for_span(Agg::Avg, 3_600),
-            "SELECT time_bucket('10 seconds', ts) AS bucket, avg(value) AS value \
+            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, avg(value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -358,17 +400,17 @@ mod tests {
     fn max_min_last_on_raw() {
         assert_eq!(
             sql_for_span(Agg::Max, 3_600),
-            "SELECT time_bucket('10 seconds', ts) AS bucket, max(value) AS value \
+            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, max(value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
         assert_eq!(
             sql_for_span(Agg::Min, 3_600),
-            "SELECT time_bucket('10 seconds', ts) AS bucket, min(value) AS value \
+            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, min(value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
         assert_eq!(
             sql_for_span(Agg::Last, 3_600),
-            "SELECT time_bucket('10 seconds', ts) AS bucket, last(value, ts) AS value \
+            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, last(value, ts) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -377,7 +419,7 @@ mod tests {
     fn integral_on_raw_finalizes_a_time_weight_partial() {
         assert_eq!(
             sql_for_span(Agg::Integral, 3_600),
-            "SELECT time_bucket('10 seconds', ts) AS bucket, \
+            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
              integral(time_weight('LOCF', ts, value)) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -391,7 +433,7 @@ mod tests {
         let span = HOUR_SECS * TARGET_BUCKETS - TARGET_BUCKETS; // ideal = 3599
         assert_eq!(
             sql_for_span(Agg::Avg, span),
-            "SELECT time_bucket('30 minutes', ts) AS bucket, avg(value) AS value \
+            "SELECT time_bucket_gapfill('30 minutes', ts, $2::timestamptz, $3::timestamptz) AS bucket, avg(value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -402,7 +444,7 @@ mod tests {
         let span = HOUR_SECS * TARGET_BUCKETS; // ideal = 3600
         assert_eq!(
             sql_for_span(Agg::Avg, span),
-            "SELECT time_bucket('1 hour', bucket) AS bucket, sum(s) / NULLIF(sum(n), 0) AS value \
+            "SELECT time_bucket_gapfill('1 hour', bucket, $2::timestamptz, $3::timestamptz) AS bucket, sum(s) / NULLIF(sum(n), 0) AS value \
              FROM readings_1h WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -412,7 +454,7 @@ mod tests {
         // 30 days: ideal = 5184 → 2 hours on readings_1h.
         assert_eq!(
             sql_for_span(Agg::Max, 30 * DAY_SECS),
-            "SELECT time_bucket('2 hours', bucket) AS bucket, max(vmax) AS value \
+            "SELECT time_bucket_gapfill('2 hours', bucket, $2::timestamptz, $3::timestamptz) AS bucket, max(vmax) AS value \
              FROM readings_1h WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -423,7 +465,7 @@ mod tests {
         let span = DAY_SECS * TARGET_BUCKETS - TARGET_BUCKETS; // ideal = 86399
         assert_eq!(
             sql_for_span(Agg::Last, span),
-            "SELECT time_bucket('12 hours', bucket) AS bucket, last(last_val, bucket) AS value \
+            "SELECT time_bucket_gapfill('12 hours', bucket, $2::timestamptz, $3::timestamptz) AS bucket, last(last_val, bucket) AS value \
              FROM readings_1h WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -434,7 +476,7 @@ mod tests {
         let span = DAY_SECS * TARGET_BUCKETS; // ideal = 86400
         assert_eq!(
             sql_for_span(Agg::Avg, span),
-            "SELECT time_bucket('1 day', bucket) AS bucket, sum(s) / NULLIF(sum(n), 0) AS value \
+            "SELECT time_bucket_gapfill('1 day', bucket, $2::timestamptz, $3::timestamptz) AS bucket, sum(s) / NULLIF(sum(n), 0) AS value \
              FROM readings_1d WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -444,7 +486,7 @@ mod tests {
         // 30 days → hour tier; integral composes the stored tw partials.
         assert_eq!(
             sql_for_span(Agg::Integral, 30 * DAY_SECS),
-            "SELECT time_bucket('2 hours', bucket) AS bucket, integral(rollup(tw)) AS value \
+            "SELECT time_bucket_gapfill('2 hours', bucket, $2::timestamptz, $3::timestamptz) AS bucket, integral(rollup(tw)) AS value \
              FROM readings_1h WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -457,7 +499,7 @@ mod tests {
         // delta must read raw; the 2-day width is kept.
         assert_eq!(
             sql_for_span(Agg::Delta, 1_000 * DAY_SECS),
-            "SELECT time_bucket('2 days', ts) AS bucket, delta(counter_agg(ts, value)) AS value \
+            "SELECT time_bucket_gapfill('2 days', ts, $2::timestamptz, $3::timestamptz) AS bucket, delta(counter_agg(ts, value)) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -466,7 +508,7 @@ mod tests {
     fn median_forces_raw_even_on_a_huge_span() {
         assert_eq!(
             sql_for_span(Agg::Median, 1_000 * DAY_SECS),
-            "SELECT time_bucket('2 days', ts) AS bucket, \
+            "SELECT time_bucket_gapfill('2 days', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
              percentile_cont(0.5) WITHIN GROUP (ORDER BY value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -476,10 +518,16 @@ mod tests {
 
     #[test]
     fn month_rolls_up_from_readings_1h_in_local_time() {
-        let sql = build_sql(Agg::Integral, t(1_600_000_000), t(1_700_000_000), Some(Bucket::Month));
+        let sql = build_sql(
+            Agg::Integral,
+            Gapfill::None,
+            t(1_600_000_000),
+            t(1_700_000_000),
+            Some(Bucket::Month),
+        );
         assert_eq!(
             sql,
-            "SELECT time_bucket('1 month', bucket, current_setting('TimeZone')) AS bucket, \
+            "SELECT time_bucket_gapfill('1 month', bucket, current_setting('TimeZone'), $2::timestamptz, $3::timestamptz) AS bucket, \
              integral(rollup(tw)) AS value \
              FROM readings_1h WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -488,11 +536,17 @@ mod tests {
     #[test]
     fn month_for_delta_sources_from_raw() {
         // delta is raw-only, so a monthly counter bucket reads raw with the same
-        // 3-arg tz-aware time_bucket over ts.
-        let sql = build_sql(Agg::Delta, t(1_600_000_000), t(1_700_000_000), Some(Bucket::Month));
+        // tz-aware time_bucket_gapfill over ts.
+        let sql = build_sql(
+            Agg::Delta,
+            Gapfill::None,
+            t(1_600_000_000),
+            t(1_700_000_000),
+            Some(Bucket::Month),
+        );
         assert_eq!(
             sql,
-            "SELECT time_bucket('1 month', ts, current_setting('TimeZone')) AS bucket, \
+            "SELECT time_bucket_gapfill('1 month', ts, current_setting('TimeZone'), $2::timestamptz, $3::timestamptz) AS bucket, \
              delta(counter_agg(ts, value)) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -503,7 +557,67 @@ mod tests {
         // span < TARGET_BUCKETS → ideal 0 → the 1-second floor.
         assert_eq!(
             sql_for_span(Agg::Avg, 100),
-            "SELECT time_bucket('1 second', ts) AS bucket, avg(value) AS value \
+            "SELECT time_bucket_gapfill('1 second', ts, $2::timestamptz, $3::timestamptz) AS bucket, avg(value) AS value \
+             FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
+        );
+    }
+
+    // --- gapfill mode: the agg default and explicit overrides ---
+
+    #[test]
+    fn locf_override_carries_the_last_level() {
+        // A held level (a temperature, a valve) opts into locf so an empty bucket
+        // carries the previous value instead of reading 0. It is no longer a
+        // default: an absent gapfill is None (see the bare-aggregate tests above).
+        let sql = build_sql(
+            Agg::Avg,
+            Gapfill::Locf,
+            t(1_600_000_000),
+            t(1_600_003_600),
+            None,
+        );
+        assert_eq!(
+            sql,
+            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+             locf(avg(value)) AS value \
+             FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
+        );
+    }
+
+    #[test]
+    fn interpolate_override_ramps_between_points() {
+        // An explicit interpolate wraps the value in interpolate(), for a
+        // smoothly-varying, coarsely-sampled signal (an absent gapfill is none).
+        let sql = build_sql(
+            Agg::Avg,
+            Gapfill::Interpolate,
+            t(1_600_000_000),
+            t(1_600_003_600),
+            None,
+        );
+        assert_eq!(
+            sql,
+            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+             interpolate(avg(value)) AS value \
+             FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
+        );
+    }
+
+    #[test]
+    fn none_override_leaves_a_gauge_bare() {
+        // none is the default; on a gauge it leaves the bare aggregate, and an
+        // empty bucket reads 0 when rows are mapped.
+        let sql = build_sql(
+            Agg::Avg,
+            Gapfill::None,
+            t(1_600_000_000),
+            t(1_600_003_600),
+            None,
+        );
+        assert_eq!(
+            sql,
+            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+             avg(value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -565,6 +679,7 @@ mod tests {
                 uuid,
                 sub: "value".to_owned(),
                 agg: Some(agg),
+                gapfill: None,
                 from,
                 to,
                 bucket: None,
