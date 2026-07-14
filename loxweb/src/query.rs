@@ -57,7 +57,7 @@ use crate::dashboard::{Agg, Bucket, Gapfill};
 /// Target number of buckets across any span; the router snaps to whatever nice
 /// ladder step comes closest to `span / TARGET_BUCKETS`, so a 1-hour and a
 /// 3-year window both come back at roughly this many points.
-const TARGET_BUCKETS: u64 = 500;
+const TARGET_BUCKETS: u64 = 1_000;
 
 /// Seconds in an hour and a day: the two `ideal`-band thresholds.
 const HOUR_SECS: u64 = 3_600;
@@ -421,13 +421,13 @@ mod tests {
         )
     }
 
-    // --- one query per agg class on the raw tier (a 1-hour span → 10s) ---
+    // --- one query per agg class on the raw tier (a 1-hour span → 5s) ---
 
     #[test]
     fn avg_on_raw_is_a_plain_mean() {
         assert_eq!(
             sql_for_span(Agg::Avg, 3_600),
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, avg(value) AS value \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, avg(value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -436,17 +436,17 @@ mod tests {
     fn max_min_last_on_raw() {
         assert_eq!(
             sql_for_span(Agg::Max, 3_600),
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, max(value) AS value \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, max(value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
         assert_eq!(
             sql_for_span(Agg::Min, 3_600),
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, min(value) AS value \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, min(value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
         assert_eq!(
             sql_for_span(Agg::Last, 3_600),
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, last(value, ts) AS value \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, last(value, ts) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -455,7 +455,7 @@ mod tests {
     fn integral_on_raw_finalizes_a_time_weight_partial() {
         assert_eq!(
             sql_for_span(Agg::Integral, 3_600),
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
              integral(time_weight('LOCF', ts, value)) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -487,9 +487,9 @@ mod tests {
 
     #[test]
     fn mid_hour_band_snaps_up_the_hour_ladder() {
-        // 30 days: ideal = 5184 → 2 hours on readings_1h.
+        // 60 days: ideal = 5184 → 2 hours on readings_1h.
         assert_eq!(
-            sql_for_span(Agg::Max, 30 * DAY_SECS),
+            sql_for_span(Agg::Max, 60 * DAY_SECS),
             "SELECT time_bucket_gapfill('2 hours', bucket, $2::timestamptz, $3::timestamptz) AS bucket, max(vmax) AS value \
              FROM readings_1h WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -519,9 +519,9 @@ mod tests {
 
     #[test]
     fn integral_on_a_cagg_rolls_up_the_partial() {
-        // 30 days → hour tier; integral composes the stored tw partials.
+        // 60 days → hour tier; integral composes the stored tw partials.
         assert_eq!(
-            sql_for_span(Agg::Integral, 30 * DAY_SECS),
+            sql_for_span(Agg::Integral, 60 * DAY_SECS),
             "SELECT time_bucket_gapfill('2 hours', bucket, $2::timestamptz, $3::timestamptz) AS bucket, integral(rollup(tw)) AS value \
              FROM readings_1h WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -531,11 +531,11 @@ mod tests {
 
     #[test]
     fn delta_forces_raw_even_on_a_huge_span() {
-        // 1000 days would route to readings_1d (2-day buckets), but a counter
-        // delta must read raw; the 2-day width is kept.
+        // 1000 days would route to readings_1d (1-day buckets), but a counter
+        // delta must read raw; the 1-day width is kept.
         assert_eq!(
             sql_for_span(Agg::Delta, 1_000 * DAY_SECS),
-            "SELECT time_bucket_gapfill('2 days', ts, $2::timestamptz, $3::timestamptz) AS bucket, delta(counter_agg(ts, value)) AS value \
+            "SELECT time_bucket_gapfill('1 day', ts, $2::timestamptz, $3::timestamptz) AS bucket, delta(counter_agg(ts, value)) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -544,7 +544,7 @@ mod tests {
     fn median_forces_raw_even_on_a_huge_span() {
         assert_eq!(
             sql_for_span(Agg::Median, 1_000 * DAY_SECS),
-            "SELECT time_bucket_gapfill('2 days', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+            "SELECT time_bucket_gapfill('1 day', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
              percentile_cont(0.5) WITHIN GROUP (ORDER BY value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -614,7 +614,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
              locf(avg(value)) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -633,7 +633,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
              interpolate(avg(value)) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -652,7 +652,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
              avg(value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
