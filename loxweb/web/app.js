@@ -545,11 +545,13 @@
     }
 
     var legend = [];
+    var seriesUnits = []; // per-series unit, inherited from the bound y-axis
     var series = panel.series.map(function (s, i) {
       var label = s.label || s.id || "series " + (i + 1);
       legend.push(label);
       var color = s.color || palette[i % palette.length];
       var yIdx = s.axis && axisIndex[s.axis] !== undefined ? axisIndex[s.axis] : 0;
+      seriesUnits[i] = (panel.axes && panel.axes[yIdx] && panel.axes[yIdx].unit) || "";
       var opt = {
         name: label,
         type: s.kind === "bar" ? "bar" : "line",
@@ -599,6 +601,29 @@
       tooltip: {
         trigger: "axis",
         axisPointer: { type: "cross", link: [{ xAxisIndex: "all" }] },
+        // Round to 3 decimals (raw f64 values otherwise print ~15 digits) and
+        // append each series' axis unit.
+        formatter: function (params) {
+          if (!params.length) {
+            return "";
+          }
+          var lines = [params[0].axisValueLabel];
+          params.forEach(function (p) {
+            var v = Array.isArray(p.value) ? p.value[1] : p.value;
+            var text;
+            if (v === null || v === undefined || (typeof v === "number" && isNaN(v))) {
+              text = "-";
+            } else {
+              text = typeof v === "number" ? String(Number(v.toFixed(3))) : String(v);
+              var unit = seriesUnits[p.seriesIndex];
+              if (unit) {
+                text += " " + unit;
+              }
+            }
+            lines.push(p.marker + p.seriesName + ": " + text);
+          });
+          return lines.join("<br/>");
+        },
       },
       // Pin the axis to the window so a dataZoom percentage maps back to an
       // exact [from,to] on requery (see onZoom).
