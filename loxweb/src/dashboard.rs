@@ -896,4 +896,22 @@ views:
         assert_eq!(after.views.len(), 1);
         assert_eq!(after.views[0].id, "only");
     }
+
+    /// The shipped example must round-trip through the very loader an operator
+    /// hits, so the sample stays runnable and documents the schema by example.
+    #[test]
+    fn example_dashboards_file_round_trips() {
+        let yaml = include_str!("../dashboards.example.yaml");
+        let dbs = DashboardStore::parse_and_validate(yaml)
+            .expect("dashboards.example.yaml must parse and validate");
+        assert_eq!(dbs.views.len(), 2);
+
+        // A three-axis panel carrying a derived series.
+        let climate = &dbs.views[0].panels[0];
+        assert_eq!(climate.axes.len(), 3);
+        assert!(climate.series.iter().any(|s| s.expr.is_some()));
+
+        // The second view buckets real calendar months.
+        assert_eq!(dbs.views[1].bucket, Some(Bucket::Month));
+    }
 }

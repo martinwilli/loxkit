@@ -125,4 +125,15 @@ dashboards: dashboards.yaml
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("pgs3cret"));
     }
+
+    /// The shipped sample config must parse through the loader, so a fresh
+    /// install can copy it and edit rather than start from a blank file.
+    #[test]
+    fn example_config_file_round_trips() {
+        let yaml = include_str!("../config.example.yaml");
+        let cfg = Config::from_yaml_str(yaml).expect("config.example.yaml must parse");
+        assert_eq!(cfg.server.bind, "127.0.0.1:8080");
+        assert_eq!(cfg.server.base_path, "");
+        assert_eq!(cfg.dashboards, PathBuf::from("/etc/loxkit/dashboards.yaml"));
+    }
 }
