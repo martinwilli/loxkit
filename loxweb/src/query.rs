@@ -31,10 +31,11 @@
 //! * `1 hour ≤ ideal < 1 day` → `readings_1h`, snapped up the whole-hour ladder.
 //! * `ideal ≥ 1 day` → `readings_1d`, snapped up the whole-day ladder (capped).
 //!
-//! Two aggregations override the tier: `delta` (counter) and `median` need
-//! per-point data that the caggs don't carry (V6 dropped the counter partial,
-//! and a percentile can't be composed from bucket rollups), so they force the
-//! raw tier regardless of span while keeping the span-appropriate bucket width.
+//! Two aggregations override the tier: `delta` and `median` need per-point data
+//! the caggs don't carry, so they force the raw tier regardless of span while
+//! keeping the span-appropriate bucket width. `delta` is last-minus-first over
+//! the bucket and the caggs store `last_val` but no `first_val` to compose it
+//! from; a percentile can't be composed from bucket rollups at all.
 //!
 //! `bucket: month` is the one calendar exception: real calendar months in local
 //! time via the 3-arg `time_bucket('1 month', <tcol>, current_setting('TimeZone'))`,
@@ -175,9 +176,11 @@ impl Tier {
 }
 
 /// Whether an aggregation can only be computed from raw per-point data. The
-/// caggs carry `(n, s, vmin, vmax, last_val, tw)` — no counter partial (V6
-/// dropped it) and nothing a percentile can be composed from — so `delta` and
-/// `median` always read raw.
+/// caggs carry `(n, s, vmin, vmax, last_val, tw)`: `delta` is last-minus-first
+/// but there is no `first_val` to pair with the stored `last_val`, and a
+/// percentile can't be composed from bucket rollups at all — so `delta` and
+/// `median` always read raw. (Adding `first_val` to the caggs would let `delta`
+/// roll up as `last(last_val) - first(first_val)`; deferred.)
 fn is_raw_only(agg: Agg) -> bool {
     matches!(agg, Agg::Delta | Agg::Median)
 }
@@ -222,9 +225,15 @@ fn value_expr(agg: Agg, tier: Tier) -> &'static str {
             Agg::Min => "min(value)",
             Agg::Last => "last(value, ts)",
             Agg::Median => "percentile_cont(0.5) WITHIN GROUP (ORDER BY value)",
-            // toolkit: delta() finalizes a counter_agg partial (handles resets);
-            // signature per timescaledb_toolkit 1.23.0, verify live.
-            Agg::Delta => "delta(counter_agg(ts, value))",
+            // Net change over the bucket: last value minus first. Deliberately
+            // NOT delta(counter_agg(...)): a counter that dithers in its last
+            // float ULP (or takes the odd sub-unit backward correction) trips
+            // counter_agg's reset detection, which reads each dip as a wrap and
+            // adds a full-counter jump -- turning a few-unit delta into millions.
+            // last-first ignores intra-bucket wobble; it only misreads a genuine
+            // mid-bucket reset, which a lifetime meter total effectively never
+            // does. first()/last() per timescaledb_toolkit 1.23.0, verify live.
+            Agg::Delta => "last(value, ts) - first(value, ts)",
             // toolkit: integral() finalizes a time_weight('LOCF') partial; its
             // default unit is value·seconds (leave unit scaling to the config's
             // scale). One-arg form on purpose. Signature per toolkit 1.23.0,
@@ -559,7 +568,7 @@ mod tests {
         // delta must read raw; the 1-day width is kept.
         assert_eq!(
             sql_for_span(Agg::Delta, 1_000 * DAY_SECS),
-            "SELECT time_bucket_gapfill('1 day', ts, $2::timestamptz, $3::timestamptz) AS bucket, delta(counter_agg(ts, value)) AS value \
+            "SELECT time_bucket_gapfill('1 day', ts, $2::timestamptz, $3::timestamptz) AS bucket, last(value, ts) - first(value, ts) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -607,7 +616,7 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT time_bucket_gapfill('1 month', ts, current_setting('TimeZone'), $2::timestamptz, $3::timestamptz) AS bucket, \
-             delta(counter_agg(ts, value)) AS value \
+             last(value, ts) - first(value, ts) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
     }
