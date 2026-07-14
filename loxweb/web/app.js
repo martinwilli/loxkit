@@ -577,7 +577,7 @@
       var yIdx = seriesAxis[i];
       var opt = {
         name: label,
-        type: s.kind === "bar" ? "bar" : "line",
+        type: s.type === "bar" ? "bar" : "line",
         yAxisIndex: yIdx,
         data: seriesData[i],
         color: color,
