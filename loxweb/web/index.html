@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!--
+      base_path support: the server rewrites the __BASE_PATH__ placeholder to
+      the configured sub-path (empty -> "/", "/app" -> "/app/") before serving
+      this file. With <base> set, every relative URL below resolves correctly
+      whether the app is mounted at the root or behind a reverse-proxy sub-path,
+      so the rest of the frontend needs zero base_path knowledge.
+    -->
+    <base href="__BASE_PATH__/" />
+    <title>loxweb</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <h1>loxweb</h1>
+    <p class="note">
+      Placeholder frontend. The config-driven ECharts panels land in a later
+      commit; for now this just confirms the API and asset wiring.
+    </p>
+    <h2>Views</h2>
+    <ul id="views"></ul>
+    <script src="echarts.min.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

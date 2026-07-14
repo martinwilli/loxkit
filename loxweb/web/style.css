@@ -1,0 +1,20 @@
+/* Placeholder styling; the real theme ships with the SPA in a later commit. */
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  margin: 2rem;
+  line-height: 1.5;
+  color: #222;
+}
+
+h1 {
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+
+.note {
+  color: #666;
+}
+
+#views {
+  line-height: 1.8;
+}

@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, bail};
 use arc_swap::ArcSwap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
 /// loxtap's default sub-channel: a control's primary state carries no sub-name
@@ -31,43 +31,47 @@ use tracing::{error, info};
 pub const DEFAULT_SUB: &str = "value";
 
 /// The whole dashboard set — the parsed contents of `dashboards.yaml`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+///
+/// Also `Serialize`: the HTTP layer hands the current snapshot straight to the
+/// frontend as JSON. The `skip_serializing_if` on the optional fields keeps that
+/// JSON as terse as the YAML — an absent key stays absent, never `null`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Dashboards {
     /// The views, each a tab of panels.
     pub views: Vec<View>,
 }
 
 /// A view: one named tab of panels sharing a default time window.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct View {
     /// Stable id (used in URLs and API paths).
     pub id: String,
     /// Human title.
     pub title: String,
     /// Default time window, e.g. `now-6M`. Absent means the app default.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<String>,
     /// Auto-refresh cadence, e.g. `10s`, or `off`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh: Option<String>,
     /// Calendar-month bucketing for this view (the one calendar exception; else
     /// the engine tier-routes by span). Inherited by panels that omit their own.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket: Option<Bucket>,
     /// The panels in this view.
     pub panels: Vec<Panel>,
 }
 
 /// A panel: one chart, `axes[] + series[]`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Panel {
     /// Panel title.
     pub title: String,
     /// Relative height hint (grid rows); layout is otherwise automatic.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
     /// Calendar-month bucketing for this panel, overriding the view's.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket: Option<Bucket>,
     /// Declared y-axes; a series may target one by `id`. Empty means a single
     /// implicit axis.
@@ -78,41 +82,41 @@ pub struct Panel {
 }
 
 /// A declared y-axis a series can be pinned to.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Axis {
     /// Axis id, referenced by `series.axis`.
     pub id: String,
     /// Which side to draw the axis on.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub side: Option<Side>,
     /// Unit label; absent falls back to `series_meta.unit`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
     /// Fixed axis minimum.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<f64>,
     /// Fixed axis maximum.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
 }
 
 /// A single series: either bound to a store uuid or derived from siblings.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Series {
     /// Optional id, so a derived sibling can reference this series in an `expr`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// Legend label; absent falls back to `series_meta.name`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     /// Target axis id (must name an [`Axis`] in the same panel).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub axis: Option<String>,
     /// Draw as a line or bars.
     #[serde(rename = "type", default)]
     pub kind: SeriesType,
     /// Explicit color; absent uses the default palette.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
     /// Line interpolation.
     #[serde(default)]
@@ -121,7 +125,7 @@ pub struct Series {
     #[serde(default)]
     pub fill: bool,
     /// Stack group; series sharing a group stack together.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack: Option<String>,
     /// Multiplier applied to values, e.g. `-1` to mirror below zero or `0.001`
     /// to rescale units.
@@ -130,17 +134,17 @@ pub struct Series {
 
     // --- binding: exactly one of {uuid (+sub,+agg)} or {expr} ---
     /// Bound series: the store uuid to read.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
     /// Bound series: the sub-channel; omitted resolves to [`DEFAULT_SUB`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub: Option<String>,
     /// Bound series: the aggregation. Absent is resolved later from
     /// `series_meta.agg_mode` (commit 3), so no default is imposed here.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agg: Option<Agg>,
     /// Derived series: an arithmetic expression over sibling series ids.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expr: Option<String>,
 }
 
@@ -155,7 +159,7 @@ impl Series {
 
 /// Calendar-month bucketing. `None` on a view/panel means the engine
 /// tier-routes by span; `month` is the single calendar exception.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Bucket {
     /// Real calendar months in local time.
@@ -163,7 +167,7 @@ pub enum Bucket {
 }
 
 /// Which side of the panel an axis is drawn on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Side {
     Left,
@@ -171,7 +175,7 @@ pub enum Side {
 }
 
 /// A series' chart type.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SeriesType {
     /// A line (the default).
@@ -182,7 +186,7 @@ pub enum SeriesType {
 }
 
 /// Line interpolation between points.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Interp {
     /// Straight segments (the default).
@@ -196,7 +200,7 @@ pub enum Interp {
 
 /// The aggregation applied when bucketing a bound series. No default: an absent
 /// `agg` is resolved from `series_meta.agg_mode` at query time (commit 3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Agg {
     /// Time-weighted (or plain) average.
