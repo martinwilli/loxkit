@@ -621,6 +621,11 @@
         if (s.stack) {
           opt.itemStyle.borderRadius = [2, 2, 0, 0];
         }
+        // Fatter bars: narrow the gap around each time band (default 20%) and,
+        // where several bar series share a band side by side, the gap between
+        // them (default 30%), so grouped bars read as blocks, not thin sticks.
+        opt.barCategoryGap = "10%";
+        opt.barGap = "10%";
       }
       return opt;
     });
