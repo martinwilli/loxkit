@@ -747,6 +747,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "loxweb"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "loxtap",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
