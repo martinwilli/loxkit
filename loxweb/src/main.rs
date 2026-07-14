@@ -6,14 +6,18 @@
 //! the loxtap process. It reuses the bridge crate as a library (its TimescaleDB
 //! connection config and wire model) rather than redefining them.
 //!
-//! This is the crate skeleton: it parses its arguments and sets up logging. The
-//! config model, the query layer, and the HTTP server land in later commits.
+//! This binary loads the static config and the dashboard set and logs a
+//! summary. The query layer and the HTTP server (which will wire the SIGHUP
+//! reload under the running server) land in later commits.
 
 use std::path::PathBuf;
 
 use clap::Parser;
-use tracing::info;
+use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
+
+use loxweb::config::Config;
+use loxweb::dashboard::DashboardStore;
 
 /// Command-line arguments.
 #[derive(Debug, Parser)]
@@ -27,12 +31,23 @@ struct Cli {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    init_tracing("info");
-    info!(config = %cli.config.display(), "loxweb starting");
+    let config = Config::load(&cli.config)?;
+    init_tracing(&config.log_level);
+
+    debug!(?config, "loaded configuration");
+
+    // Fail-fast: a bad dashboards file must not start the service.
+    let store = DashboardStore::load(&config.dashboards)?;
+    info!(
+        bind = %config.server.bind,
+        dashboards = %config.dashboards.display(),
+        views = store.current().views.len(),
+        "loxweb configuration loaded; the HTTP server lands in a later commit"
+    );
     Ok(())
 }
 
-/// Set up `tracing`, honoring `RUST_LOG` and falling back to `fallback_level`.
+/// Set up `tracing`, honoring `RUST_LOG` and falling back to the config level.
 fn init_tracing(fallback_level: &str) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(fallback_level));
