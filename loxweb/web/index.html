@@ -15,13 +15,11 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <h1>loxweb</h1>
-    <p class="note">
-      Placeholder frontend. The config-driven ECharts panels land in a later
-      commit; for now this just confirms the API and asset wiring.
-    </p>
-    <h2>Views</h2>
-    <ul id="views"></ul>
+    <header id="topbar">
+      <nav id="views" class="tabs" aria-label="Views"></nav>
+      <div id="ranges" class="ranges" aria-label="Time range"></div>
+    </header>
+    <main id="panels"></main>
     <script src="echarts.min.js"></script>
     <script src="app.js"></script>
   </body>

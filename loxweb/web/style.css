@@ -1,20 +1,162 @@
-/* Placeholder styling; the real theme ships with the SPA in a later commit. */
+/* loxweb theme. Chrome and ink come from the dataviz reference palette; the
+   light and dark sets are both selected (not an automatic flip) and swap on the
+   OS preference. Charts carry their own themed colors from app.js; this file
+   dresses the page chrome around them. */
+
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink2: #52514e;
+  --muted: #898781;
+  --border: rgba(11, 11, 11, 0.1);
+  --accent: #2a78d6;
+  --danger: #d03b3b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink2: #c3c2b7;
+    --muted: #898781;
+    --border: rgba(255, 255, 255, 0.1);
+    --accent: #3987e5;
+    --danger: #e66767;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
 body {
-  font-family: system-ui, -apple-system, sans-serif;
-  margin: 2rem;
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--page);
+  color: var(--ink);
   line-height: 1.5;
-  color: #222;
 }
 
-h1 {
+/* --- top bar: view tabs (left) + range presets (right) in one row --- */
+
+#topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.6rem 1rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.tabs,
+.ranges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.tab,
+.range {
+  font: inherit;
+  font-size: 0.875rem;
+  padding: 0.3rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink2);
+  cursor: pointer;
+}
+
+.tab:hover,
+.range:hover {
+  color: var(--ink);
+  border-color: var(--muted);
+}
+
+.tab.active {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.range.active {
+  color: var(--ink);
+  border-color: var(--accent);
   font-weight: 600;
-  margin-bottom: 0.25rem;
 }
 
-.note {
-  color: #666;
+.range-abs {
+  font-size: 0.8rem;
+  color: var(--muted);
+  padding-left: 0.5rem;
+  font-variant-numeric: tabular-nums;
 }
 
-#views {
-  line-height: 1.8;
+/* --- panels: one card per panel, stacked vertically --- */
+
+#panels {
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.75rem 0.9rem 0.9rem;
+}
+
+.panel-title {
+  margin: 0 0 0.4rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.plot {
+  width: 100%;
+  min-height: 160px;
+  position: relative;
+  transition: opacity 0.15s ease;
+}
+
+/* Refetch keeps the frame: dim the prior render while data reloads. */
+.plot.loading {
+  opacity: 0.5;
+}
+
+.panel-error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  text-align: center;
+  color: var(--danger);
+  font-size: 0.9rem;
+  background: var(--surface);
+}
+
+.empty,
+.fatal-error {
+  color: var(--muted);
+  padding: 2rem 1rem;
+  text-align: center;
+}
+
+.fatal-error {
+  color: var(--danger);
 }
