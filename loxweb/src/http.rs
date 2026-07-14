@@ -162,7 +162,11 @@ async fn get_series(
         resolve_request(&dash, &q.view, q.panel, q.series, q.from, q.to)?
     };
     let points = query::query_series(&state.pool, &req).await.map_err(|e| {
-        error!(error = %e, uuid = %req.uuid, "series query failed");
+        // `{e:#}` prints the whole anyhow context chain on one line; plain
+        // Display stops at the top context and hides the real cause (the db
+        // error), which is exactly what we need in the log.
+        let cause = format!("{e:#}");
+        error!(error = %cause, uuid = %req.uuid, "series query failed");
         ApiError::Internal
     })?;
     let data = points
