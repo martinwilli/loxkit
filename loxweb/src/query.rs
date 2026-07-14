@@ -65,12 +65,17 @@ const HOUR_SECS: u64 = 3_600;
 const DAY_SECS: u64 = 86_400;
 
 /// Sub-hour bucket ladder for the raw tier: `(width in seconds, SQL literal)`.
+/// A 1-2-5-10-15-30 rung per decade, so a zoom crosses a rung every ~2x rather
+/// than the old 5x jumps (`1s→5s`, `1m→5m`) that made the resolution feel static.
 const SUBHOUR_LADDER: &[(u64, &str)] = &[
     (1, "1 second"),
+    (2, "2 seconds"),
     (5, "5 seconds"),
     (10, "10 seconds"),
+    (15, "15 seconds"),
     (30, "30 seconds"),
     (60, "1 minute"),
+    (120, "2 minutes"),
     (300, "5 minutes"),
     (600, "10 minutes"),
     (900, "15 minutes"),
@@ -89,9 +94,12 @@ const HOUR_LADDER: &[(u64, &str)] = &[
 ];
 
 /// Whole-day bucket ladder for the `readings_1d` tier (capped at the top step).
+/// 3-day and 5-day rungs break up the old 2d→7d gap (a 3.5x jump).
 const DAY_LADDER: &[(u64, &str)] = &[
     (86_400, "1 day"),
     (2 * 86_400, "2 days"),
+    (3 * 86_400, "3 days"),
+    (5 * 86_400, "5 days"),
     (7 * 86_400, "7 days"),
     (14 * 86_400, "14 days"),
     (30 * 86_400, "30 days"),
@@ -628,6 +636,26 @@ mod tests {
             sql_for_span(Agg::Avg, 100),
             "SELECT time_bucket_gapfill('1 second', ts, $2::timestamptz, $3::timestamptz) AS bucket, avg(value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
+        );
+    }
+
+    #[test]
+    fn densified_sub_hour_rung_snaps_to_two_seconds() {
+        // ideal = 2 lands on the 2-second rung added to break the old 1s→5s gap.
+        assert_eq!(
+            sql_for_span(Agg::Avg, 2 * TARGET_BUCKETS),
+            "SELECT time_bucket_gapfill('2 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, avg(value) AS value \
+             FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
+        );
+    }
+
+    #[test]
+    fn densified_day_rung_snaps_to_three_days() {
+        // ideal = 3 days lands on the 3-day rung added to break the old 2d→7d gap.
+        assert_eq!(
+            sql_for_span(Agg::Avg, 3 * DAY_SECS * TARGET_BUCKETS),
+            "SELECT time_bucket_gapfill('3 days', bucket, $2::timestamptz, $3::timestamptz) AS bucket, sum(s) / NULLIF(sum(n), 0) AS value \
+             FROM readings_1d WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
     }
 
