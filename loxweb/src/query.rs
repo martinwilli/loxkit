@@ -129,6 +129,16 @@ pub struct Point {
     pub v: f64,
 }
 
+/// The result of a series query: the dense points plus the resolved unit label
+/// from `series_meta` (`None` when the uuid has no meta row or a NULL unit).
+#[derive(Clone, Debug)]
+pub struct SeriesResult {
+    /// The store's unit label for this series, the display default.
+    pub unit: Option<String>,
+    /// The tier-routed, gapfilled points.
+    pub points: Vec<Point>,
+}
+
 /// The source tier a query reads from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tier {
@@ -319,30 +329,53 @@ fn pool_from_pg_config(pg_config: tokio_postgres::Config) -> Result<Pool> {
     Pool::builder(mgr).build().context("building the read pool")
 }
 
-/// Resolve an absent `agg` from `series_meta.agg_mode`: counter → delta, gauge
-/// (or an unresolved uuid) → avg. Matches the ingest classification the sink
-/// persists.
-async fn resolve_agg(client: &deadpool_postgres::Client, uuid: Uuid) -> Result<Agg> {
+/// One series' `series_meta`: the ingest-time aggregation class and the unit
+/// label. Both are absent when the uuid has no meta row yet (an unresolved wire
+/// uuid still gets its readings, just no labels).
+struct Meta {
+    agg_mode: Option<String>,
+    unit: Option<String>,
+}
+
+/// Read a series' `series_meta` row (agg_mode and unit) in one lookup. A missing
+/// row yields an all-`None` [`Meta`].
+async fn fetch_meta(client: &deadpool_postgres::Client, uuid: Uuid) -> Result<Meta> {
     let row = client
-        .query_opt("SELECT agg_mode FROM series_meta WHERE uuid = $1", &[&uuid])
+        .query_opt("SELECT agg_mode, unit FROM series_meta WHERE uuid = $1", &[&uuid])
         .await
-        .context("resolving agg_mode from series_meta")?;
-    let mode: Option<String> = row.map(|r| r.get(0));
-    Ok(match mode.as_deref() {
-        Some("counter") => Agg::Delta,
-        _ => Agg::Avg,
+        .context("reading series_meta")?;
+    Ok(match row {
+        Some(r) => Meta {
+            agg_mode: r.get(0),
+            unit: r.get(1),
+        },
+        None => Meta {
+            agg_mode: None,
+            unit: None,
+        },
     })
 }
 
-/// Resolve the aggregation (if absent), build the tier-routed SQL, run it, and
-/// map rows to points. Gapfill emits one row per bucket; an empty bucket's NULL
-/// coalesces to 0, so every series comes back on the identical dense grid.
-pub async fn query_series(pool: &Pool, req: &SeriesRequest) -> Result<Vec<Point>> {
+/// Resolve an absent `agg` from `series_meta.agg_mode`: counter → delta, gauge
+/// (or an unresolved uuid) → avg. Matches the ingest classification the sink
+/// persists.
+fn agg_from_mode(mode: Option<&str>) -> Agg {
+    match mode {
+        Some("counter") => Agg::Delta,
+        _ => Agg::Avg,
+    }
+}
+
+/// Resolve the aggregation (if absent) and the unit from `series_meta`, build the
+/// tier-routed SQL, run it, and map rows to points. Gapfill emits one row per
+/// bucket; an empty bucket's NULL coalesces to 0, so every series comes back on
+/// the identical dense grid.
+pub async fn query_series(pool: &Pool, req: &SeriesRequest) -> Result<SeriesResult> {
     let client = pool.get().await.context("getting a read connection")?;
-    let agg = match req.agg {
-        Some(agg) => agg,
-        None => resolve_agg(&client, req.uuid).await?,
-    };
+    let meta = fetch_meta(&client, req.uuid).await?;
+    let agg = req
+        .agg
+        .unwrap_or_else(|| agg_from_mode(meta.agg_mode.as_deref()));
     let gapfill = req.gapfill.unwrap_or(Gapfill::None);
     let sql = build_sql(agg, gapfill, req.from, req.to, req.bucket);
     let rows = client
@@ -359,7 +392,10 @@ pub async fn query_series(pool: &Pool, req: &SeriesRequest) -> Result<Vec<Point>
         let v = row.get::<_, Option<f64>>(1).unwrap_or(0.0);
         points.push(Point { t, v });
     }
-    Ok(points)
+    Ok(SeriesResult {
+        unit: meta.unit,
+        points,
+    })
 }
 
 #[cfg(test)]
@@ -684,8 +720,8 @@ mod tests {
                 to,
                 bucket: None,
             };
-            let points = query_series(&pool, &req).await.expect("query series");
-            assert!(!points.is_empty(), "{agg:?} must return buckets");
+            let result = query_series(&pool, &req).await.expect("query series");
+            assert!(!result.points.is_empty(), "{agg:?} must return buckets");
         }
 
         client
