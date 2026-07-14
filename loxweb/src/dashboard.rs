@@ -145,8 +145,9 @@ pub struct Series {
     pub agg: Option<Agg>,
     /// Bound series: how an empty bucket is filled on the shared query grid —
     /// carry the last value (`locf`), linearly `interpolate`, or leave it empty
-    /// (`none`, read as 0). Absent defaults to `none`; a signal that should carry
-    /// or ramp across gaps (a temperature, a level) opts into `locf`/`interpolate`.
+    /// (`none`, read as 0). Absent resolves a default from the chart type and
+    /// aggregation (a gauge line carries, a bar or a delta/integral accumulation
+    /// reads 0); set this to override, e.g. `interpolate` for a smooth signal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gapfill: Option<Gapfill>,
     /// Derived series: an arithmetic expression over sibling series ids.
@@ -224,8 +225,9 @@ pub enum Agg {
 
 /// How an empty bucket gets a value on the shared query grid. Every bound series
 /// is bucketed onto the same dense grid so a panel's stack lines up index-for-
-/// index; this picks what fills the empties. Absent on a series defaults to
-/// `None` (no fill); `locf`/`interpolate` are explicit opt-ins.
+/// index; this picks what fills the empties. Absent on a series resolves a
+/// default from the chart type and aggregation (see [`Series::gapfill`]);
+/// `locf`/`interpolate`/`none` set here are explicit overrides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Gapfill {
@@ -236,8 +238,9 @@ pub enum Gapfill {
     /// Linearly interpolate between the surrounding points (a first-order hold);
     /// for a smoothly-varying, coarsely-sampled signal like a forecast.
     Interpolate,
-    /// No fill (the default): an empty bucket stays empty and reads as 0. Right
-    /// for an accumulation, or an on-change meter that goes quiet at zero.
+    /// No fill: an empty bucket stays empty and reads as 0. Right for an
+    /// accumulation, or an on-change meter that goes quiet at zero — the resolved
+    /// default for a bar and for delta/integral.
     None,
 }
 

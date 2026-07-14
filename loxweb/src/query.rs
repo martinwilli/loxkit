@@ -52,7 +52,7 @@ use uuid::Uuid;
 
 use loxtap::config::TimescaleConfig;
 
-use crate::dashboard::{Agg, Bucket, Gapfill};
+use crate::dashboard::{Agg, Bucket, Gapfill, SeriesType};
 
 /// Target number of buckets across any span; the router snaps to whatever nice
 /// ladder step comes closest to `span / TARGET_BUCKETS`, so a 1-hour and a
@@ -108,10 +108,15 @@ pub struct SeriesRequest {
     /// The aggregation. `None` means "resolve from `series_meta.agg_mode`" at
     /// query time (gauge → avg, counter → delta).
     pub agg: Option<Agg>,
-    /// How empty buckets fill on the shared grid. `None` means no fill
-    /// (`Gapfill::None`): an empty bucket reads as 0. A series carries or ramps
-    /// across gaps only by opting into `locf`/`interpolate`.
+    /// How empty buckets fill on the shared grid. `None` defers to a default
+    /// resolved from `kind` and the (resolved) `agg` (see [`default_gapfill`]):
+    /// a bar or a `delta`/`integral` accumulation reads an empty bucket as 0,
+    /// a gauge line carries the last level. An explicit `locf`/`interpolate`/
+    /// `none` overrides that default.
     pub gapfill: Option<Gapfill>,
+    /// The chart type, used only to resolve the gapfill default (a bar's empty
+    /// buckets zero-fill, a line's carry forward). Never enters the SQL.
+    pub kind: SeriesType,
     /// Inclusive start of the window.
     pub from: SystemTime,
     /// Exclusive end of the window.
@@ -366,6 +371,23 @@ fn agg_from_mode(mode: Option<&str>) -> Agg {
     }
 }
 
+/// The gapfill to use when a series names none explicitly. `delta`/`integral`
+/// are accumulations: an empty bucket is a genuine zero (no flow, no counter
+/// change), so they never carry. The gauge aggregations straddle two cases the
+/// chart type tells apart — a bar is a quantity that reads 0 when absent, a line
+/// is a level that holds between samples. So a line carries the last level
+/// (`locf`); zoomed in past the on-change log cadence it stays a curve instead
+/// of picket-fencing down to 0 on every empty bucket.
+fn default_gapfill(agg: Agg, kind: SeriesType) -> Gapfill {
+    match agg {
+        Agg::Delta | Agg::Integral => Gapfill::None,
+        _ => match kind {
+            SeriesType::Bar => Gapfill::None,
+            SeriesType::Line => Gapfill::Locf,
+        },
+    }
+}
+
 /// Resolve the aggregation (if absent) and the unit from `series_meta`, build the
 /// tier-routed SQL, run it, and map rows to points. Gapfill emits one row per
 /// bucket; an empty bucket's NULL coalesces to 0, so every series comes back on
@@ -376,7 +398,9 @@ pub async fn query_series(pool: &Pool, req: &SeriesRequest) -> Result<SeriesResu
     let agg = req
         .agg
         .unwrap_or_else(|| agg_from_mode(meta.agg_mode.as_deref()));
-    let gapfill = req.gapfill.unwrap_or(Gapfill::None);
+    let gapfill = req
+        .gapfill
+        .unwrap_or_else(|| default_gapfill(agg, req.kind));
     let sql = build_sql(agg, gapfill, req.from, req.to, req.bucket);
     let rows = client
         .query(&sql, &[&req.uuid, &req.from, &req.to])
@@ -658,6 +682,36 @@ mod tests {
         );
     }
 
+    // --- the absent-gapfill default: keyed on chart type, agg pins the flows ---
+
+    #[test]
+    fn gauge_line_defaults_to_locf() {
+        // A held level drawn as a line carries across empty buckets, so zooming
+        // in past the log cadence stays a curve instead of picket-fencing to 0.
+        for agg in [Agg::Avg, Agg::Median, Agg::Min, Agg::Max, Agg::Last] {
+            assert_eq!(default_gapfill(agg, SeriesType::Line), Gapfill::Locf);
+        }
+    }
+
+    #[test]
+    fn gauge_bar_defaults_to_none() {
+        // A quantity drawn as bars reads 0 when absent (an on-change meter quiet
+        // at zero), so an empty bucket must stay 0, not carry the last level.
+        for agg in [Agg::Avg, Agg::Median, Agg::Min, Agg::Max, Agg::Last] {
+            assert_eq!(default_gapfill(agg, SeriesType::Bar), Gapfill::None);
+        }
+    }
+
+    #[test]
+    fn accumulations_default_to_none_regardless_of_type() {
+        // delta/integral have a genuine zero in an empty bucket; the type never
+        // overrides that, so a counter charted as a line still reads 0, not locf.
+        for agg in [Agg::Delta, Agg::Integral] {
+            assert_eq!(default_gapfill(agg, SeriesType::Line), Gapfill::None);
+            assert_eq!(default_gapfill(agg, SeriesType::Bar), Gapfill::None);
+        }
+    }
+
     #[test]
     fn build_pool_is_lazy_and_needs_no_database() {
         // deadpool creates connections on demand, so a pool over an unreachable
@@ -716,6 +770,7 @@ mod tests {
                 sub: "value".to_owned(),
                 agg: Some(agg),
                 gapfill: None,
+                kind: SeriesType::Line,
                 from,
                 to,
                 bucket: None,
