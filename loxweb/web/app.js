@@ -415,22 +415,16 @@
   }
 
   // The wheel/slider zoom lives inside the loaded data, so a panel fetches and
-  // pins its x-axis to a window PADDED by this fraction of the span on each
-  // side, while the dataZoom shows only the inner [from,to]. That inset gives
-  // scroll-out room to reveal loaded margin instead of dead-ending at the data
-  // edge; and a settled zoom that stays within the margin AND keeps the same
-  // bucket rung skips the requery entirely (see zoomRestingInLoaded), so a burst
-  // of wheel notches no longer refetches identical data every notch. Since the
-  // inner window is set by absolute value, the visible range holds steady across
-  // a redraw (see buildPanelOption and onZoom).
+  // pins its x-axis to a window PADDED by this fraction of the span on each side,
+  // while the dataZoom shows only the inner [from,to]. That inset gives scroll-out
+  // room to reveal loaded margin instead of dead-ending at the data edge while a
+  // drag is still in flight; a settled zoom requeries regardless (see onZoom). The
+  // bucket width, though, follows the inner visible window rather than this padded
+  // fetch, so what the user actually sees hits the server's target point count --
+  // fetchSeries passes the visible window as vfrom/vto alongside the padded
+  // from/to. Since the inner window is set by absolute value, the visible range
+  // holds steady across a redraw (see buildPanelOption and onZoom).
   var ZOOM_PAD = 0.5;
-
-  // A zoom-out saturates flush against the padded extent (the axis is pinned to
-  // it), so "still inside the loaded window" holds trivially and would dead-end
-  // the zoom. zoomRestingInLoaded instead requires this fraction of the visible
-  // span as unused margin before it skips the requery; once the window eats into
-  // that margin, a wider window is fetched. Keep well below ZOOM_PAD.
-  var ZOOM_SLACK = 0.05;
 
   function padWindow(win) {
     var pad = (win.to - win.from) * ZOOM_PAD;
@@ -446,42 +440,6 @@
       from: floor !== null ? Math.max(left, floor) : left,
       to: Math.min(Math.round(win.to + pad), Date.now()),
     };
-  }
-
-  // A client-side mirror of the server tier router (query.rs route/snap): map a
-  // window span to the bucket-width rung it resolves to, as a stable key. The
-  // server stays authoritative for the query; the client uses this ONLY to tell
-  // whether a settled zoom would change the resolution, so an in-pad zoom that
-  // keeps the same rung can skip the requery (see zoomRestingInLoaded). Keep the
-  // ladders and TARGET_BUCKETS in sync with query.rs. Rungs don't overlap across
-  // tiers, so the width in seconds is itself a unique key.
-  var TARGET_BUCKETS = 1000;
-  var HOUR_SECS = 3600;
-  var DAY_SECS = 86400;
-  var SUBHOUR_LADDER = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800];
-  var HOUR_LADDER = [3600, 7200, 10800, 14400, 21600, 28800, 43200];
-  var DAY_LADDER = [86400, 172800, 259200, 432000, 604800, 1209600, 2592000];
-
-  function snapLadder(ladder, ideal) {
-    for (var i = 0; i < ladder.length; i += 1) {
-      if (ladder[i] >= ideal) {
-        return ladder[i];
-      }
-    }
-    return ladder[ladder.length - 1];
-  }
-
-  // Span in ms -> resolved bucket width in seconds. Mirrors the server's integer
-  // math: span_secs = floor(ms/1000), ideal = floor(span_secs / TARGET_BUCKETS).
-  function bucketWidth(spanMs) {
-    var ideal = Math.floor(Math.floor(spanMs / 1000) / TARGET_BUCKETS);
-    if (ideal < HOUR_SECS) {
-      return snapLadder(SUBHOUR_LADDER, ideal);
-    }
-    if (ideal < DAY_SECS) {
-      return snapLadder(HOUR_LADDER, ideal);
-    }
-    return snapLadder(DAY_LADDER, ideal);
   }
 
   function readUrl() {
@@ -572,7 +530,10 @@
       });
   }
 
-  function fetchSeries(viewId, panelIdx, seriesIdx, win, signal) {
+  // `win` is the (padded) window to scan; `viewWin` is the visible window the user
+  // sees, sent as vfrom/vto so the server picks the bucket width for what's on
+  // screen rather than for the wider fetch.
+  function fetchSeries(viewId, panelIdx, seriesIdx, win, viewWin, signal) {
     var url =
       "api/series?view=" +
       encodeURIComponent(viewId) +
@@ -583,7 +544,11 @@
       "&from=" +
       win.from +
       "&to=" +
-      win.to;
+      win.to +
+      "&vfrom=" +
+      viewWin.from +
+      "&vto=" +
+      viewWin.to;
     return fetch(url, { signal: signal }).then(function (resp) {
       if (!resp.ok) {
         throw new Error("api/series HTTP " + resp.status);
@@ -855,7 +820,7 @@
 
     var fetches = panel.series.map(function (s, seriesIdx) {
       if (s.uuid !== undefined && s.uuid !== null) {
-        return fetchSeries(view.id, panelIdx, seriesIdx, padWin, signal);
+        return fetchSeries(view.id, panelIdx, seriesIdx, padWin, win, signal);
       }
       return Promise.resolve(null); // derived: computed client-side
     });
@@ -874,21 +839,8 @@
         var seriesData = buildPanelSeriesData(panel.series, boundPoints);
         // Remember the extent we pinned the axis to, so onZoom can resolve a
         // zoom's percentages against the window actually on screen (a burst of
-        // ticks all map against this, not against the drifting state.range), and
-        // the rung this data was fetched at, so a later zoom can tell whether a
-        // requery would change the resolution (see zoomRestingInLoaded). Also
-        // note whether padWindow clamped the right edge to now: if it did there
-        // is no newer data to reveal, so zoomRestingInLoaded must not treat a
-        // window flush against that edge as "wants more" (it is flush from the
-        // very first load of a recent-data view). The left edge mirrors it:
-        // __padLeftAtFloor records whether padWindow clamped to the data floor,
-        // so a zoom-out resting on the oldest sample doesn't chase older data.
+        // ticks all map against this, not against the drifting state.range).
         chart.__padWin = padWin;
-        chart.__loadedKey = bucketWidth(padWin.to - padWin.from);
-        chart.__padRightAtNow =
-          padWin.to < Math.round(win.to + (win.to - win.from) * ZOOM_PAD);
-        chart.__padLeftAtFloor =
-          padWin.from > Math.round(win.from - (win.to - win.from) * ZOOM_PAD);
         suppressZoom = true;
         chart.setOption(buildPanelOption(panel, seriesData, win, padWin, dbUnits), {
           notMerge: true,
@@ -930,8 +882,8 @@
   // [from,to] (value bounds are the fallback), switch the global
   // range to that window, DEBOUNCE the burst (connected panels each fire an
   // event), cancel any in-flight fetches, and refetch every panel once. The
-  // server tier-routes by span, so a narrower window transparently pulls a finer
-  // aggregate tier.
+  // server tier-routes by the visible span we hand it, so a narrower window
+  // transparently pulls a finer aggregate tier.
   // =========================================================================
 
   var zoomTimer = null;
@@ -970,46 +922,12 @@
     }
     zoomTimer = setTimeout(function () {
       zoomTimer = null;
-      if (zoomRestingInLoaded()) {
-        return; // resolution unchanged and the view sits in loaded margin;
-        // ECharts already drew the client-side zoom, so a requery is a no-op.
-      }
+      // Always requery once the burst settles. ECharts has already drawn the
+      // client-side zoom against the loaded (padded) data, but only the server can
+      // rebucket to the resolution the new visible window wants, so crossing a
+      // bucket boundary and staying inside one both come back consistently drawn.
       reloadAllPanels();
     }, 280);
-  }
-
-  // Whether a settled zoom needs no requery: every chart's new window still
-  // sits inside the padded extent its data was loaded at WITH scroll-out margin
-  // to spare, AND that data was fetched at the same bucket rung this window
-  // would resolve to. Then the loaded series already cover the view at the right
-  // density and ECharts has rendered the client-side zoom.
-  //
-  // The margin test (ZOOM_SLACK) is what lets a zoom-OUT eventually requery: the
-  // axis is pinned to the padded extent, so wheeling out saturates flush against
-  // it and a bare "within loaded" test would always hold and dead-end the zoom.
-  // Once the window eats into the last sliver of margin we refetch a wider
-  // window instead. Each edge is exempt when the load clamped it to the data:
-  // the right when it hit now (__padRightAtNow, nothing newer to reveal), the
-  // left when it hit the view floor (__padLeftAtFloor, nothing older) -- else a
-  // zoom-out parked on the oldest sample would requery forever. Conservative --
-  // a chart that hasn't loaded (no __padWin) forces a reload rather than risk
-  // showing stale resolution.
-  function zoomRestingInLoaded() {
-    if (!charts.length) {
-      return false;
-    }
-    var win = resolveWindow();
-    var pad = padWindow(win);
-    var key = bucketWidth(pad.to - pad.from);
-    var slack = (win.to - win.from) * ZOOM_SLACK;
-    return charts.every(function (c) {
-      if (!c.__padWin || c.__loadedKey !== key) {
-        return false;
-      }
-      var leftOk = c.__padLeftAtFloor || win.from - c.__padWin.from >= slack;
-      var rightOk = c.__padRightAtNow || c.__padWin.to - win.to >= slack;
-      return leftOk && rightOk;
-    });
   }
 
   // Refetch every panel of the current view against the current window, with a
