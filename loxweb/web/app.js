@@ -292,7 +292,7 @@
   // A relative range is `now` or `now-<n><unit>` with units s m h d w M y
   // (m = minutes, M = months). It resolves against a supplied clock so it is
   // deterministic under test. Months/years use calendar arithmetic; the rest
-  // are fixed multiples. Refresh is `<n><unit>` (s|m|h) or `off`.
+  // are fixed multiples.
   // =========================================================================
 
   var FIXED_UNIT_MS = {
@@ -330,21 +330,6 @@
     return { from: from, to: to };
   }
 
-  function parseRefreshMs(spec) {
-    if (spec === undefined || spec === null) {
-      return null;
-    }
-    var s = String(spec).trim();
-    if (s === "" || s === "off") {
-      return null;
-    }
-    var m = /^(\d+)([smh])$/.exec(s);
-    if (!m) {
-      return null;
-    }
-    return parseInt(m[1], 10) * FIXED_UNIT_MS[m[2]];
-  }
-
   // --- exports for headless unit tests; browser engine does not run in node ---
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
@@ -358,7 +343,6 @@
       evalDerivedGrid: evalDerivedGrid,
       buildPanelSeriesData: buildPanelSeriesData,
       parseRange: parseRange,
-      parseRefreshMs: parseRefreshMs,
     };
     return;
   }
@@ -510,8 +494,8 @@
 
   // =========================================================================
   // Section 6 -- data fetch, with in-flight cancellation. A drag-zoom or a
-  // refresh supersedes any pending fetch: we abort the previous batch before
-  // starting a new one, so a narrow zoom never races a stale wide response.
+  // view/range switch supersedes any pending fetch: we abort the previous batch
+  // before starting a new one, so a narrow zoom never races a stale wide response.
   // =========================================================================
 
   var inflight = null;
@@ -684,9 +668,8 @@
     });
 
     return {
-      // Never animate: an initial line-draw is just slow, and on data updates
-      // (zoom requery, refresh) a transition slides the graph around before it
-      // settles on the new window.
+      // Never animate: an initial line-draw is just slow, and on a zoom requery
+      // a transition slides the graph around before it settles on the new window.
       animation: false,
       backgroundColor: "transparent",
       textStyle: { color: chrome.ink2, fontFamily: "system-ui, -apple-system, sans-serif" },
@@ -807,7 +790,7 @@
 
   // Fetch a panel's bound series, evaluate its derived series, and paint.
   // A failed bound fetch shows a per-panel error rather than crashing the view;
-  // an aborted fetch (a superseding zoom/refresh) is ignored.
+  // an aborted fetch (a superseding zoom) is ignored.
   function loadPanel(view, panel, panelIdx, chart, plot, win) {
     plot.classList.add("loading");
     var signal = inflight ? inflight.signal : undefined;
@@ -874,7 +857,7 @@
   }
 
   // =========================================================================
-  // Section 9 -- interaction: drag-zoom -> tier-routed requery, and refresh.
+  // Section 9 -- interaction: drag-zoom -> tier-routed requery.
   //
   // The zoom read is the interaction risk. On a datazoom event we map the
   // reported percentages against the chart's rendered axis extent to an absolute
@@ -970,40 +953,6 @@
     });
   }
 
-  var refreshTimer = null;
-
-  function scheduleRefresh() {
-    if (refreshTimer) {
-      clearInterval(refreshTimer);
-      refreshTimer = null;
-    }
-    if (document.hidden) {
-      return; // paused while the tab is hidden
-    }
-    var view = currentView();
-    var ms = view ? parseRefreshMs(view.refresh) : null;
-    if (!ms) {
-      return;
-    }
-    refreshTimer = setInterval(function () {
-      // A relative range slides `now` forward; an absolute one refetches its
-      // fixed window (still useful -- the latest tier data may have changed).
-      reloadAllPanels();
-    }, ms);
-  }
-
-  function onVisibility() {
-    if (document.hidden) {
-      if (refreshTimer) {
-        clearInterval(refreshTimer);
-        refreshTimer = null;
-      }
-    } else {
-      reloadAllPanels();
-      scheduleRefresh();
-    }
-  }
-
   // =========================================================================
   // Section 10 -- top bar: view tabs and range presets.
   // =========================================================================
@@ -1070,7 +1019,6 @@
     abortInflight();
     inflight = new AbortController();
     renderView();
-    scheduleRefresh();
   }
 
   // =========================================================================
@@ -1093,7 +1041,6 @@
         renderRanges();
         fullRender();
 
-        document.addEventListener("visibilitychange", onVisibility);
         if (global.matchMedia) {
           var mq = global.matchMedia("(prefers-color-scheme: dark)");
           var onThemeChange = function () {

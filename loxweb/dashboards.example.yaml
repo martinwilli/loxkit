@@ -18,12 +18,11 @@
 # between points (a coarsely sampled smooth signal).
 
 views:
-  # A short live window, auto-refreshing. Panels mix bars and lines, pin series
-  # to their own axes, stack, mirror below zero, and compute derived series.
+  # A short window. Panels mix bars and lines, pin series to their own axes,
+  # stack, mirror below zero, and compute derived series.
   - id: overview
     title: Overview
     range: now-2d          # per-view default window
-    refresh: 10s           # auto-refresh cadence (or: off)
 
     panels:
       - title: Climate            # mixed bars+line, three axes, a derived ratio
@@ -132,12 +131,11 @@ views:
             interp: smooth
 
   # A multi-year window bucketed into real calendar months. Counter series use
-  # a delta, a power gauge an integral; no auto-refresh.
+  # a delta, a power gauge an integral.
   - id: energy
     title: Energy
     range: now-3y
     bucket: month          # real calendar months, local tz
-    refresh: off
 
     panels:
       - title: Monthly Energy     # delta + integral aggregates, a mirror, a net line

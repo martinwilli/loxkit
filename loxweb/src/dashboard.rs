@@ -53,9 +53,6 @@ pub struct View {
     /// Default time window, e.g. `now-6M`. Absent means the app default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<String>,
-    /// Auto-refresh cadence, e.g. `10s`, or `off`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh: Option<String>,
     /// Bucketing policy for this view: the scalar shorthand `day`/`month` (a
     /// fixed calendar unit), or a zoom-driven [`BucketSpec::Schedule`] that picks
     /// the bucket width from the current window span. Absent means the engine
@@ -958,7 +955,6 @@ views:
   - id: overview
     title: Overview
     range: now-6M
-    refresh: 10s
     panels:
       - title: Heating
         height: 10
@@ -993,7 +989,6 @@ views:
         let overview = &dbs.views[0];
         assert_eq!(overview.id, "overview");
         assert_eq!(overview.range.as_deref(), Some("now-6M"));
-        assert_eq!(overview.refresh.as_deref(), Some("10s"));
         assert_eq!(overview.bucket, None);
 
         let heating = &overview.panels[0];

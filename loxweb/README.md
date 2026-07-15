@@ -36,7 +36,6 @@ views:
   - id: overview          # stable id, used in the URL
     title: Overview
     range: now-2d          # default window (relative: now-<n>{s,m,h,d,w,M,y})
-    refresh: 10s           # auto-refresh cadence, or: off
     panels:
       - title: Climate
         height: 10                       # relative height hint
