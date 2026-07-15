@@ -160,12 +160,13 @@ struct SeriesQuery {
 /// The `GET /api/series` response: the store's unit label for the series (from
 /// `series_meta`, omitted when unset) plus the ECharts-native `[[t_ms, value], …]`
 /// points. The frontend uses `unit` as the display default, overridable by a
-/// config axis unit.
+/// config axis unit. A point's value is `null` for an unfilled gap (a locf/
+/// interpolate edge), which ECharts renders as a break in the line.
 #[derive(Debug, Serialize)]
 struct SeriesResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     unit: Option<String>,
-    points: Vec<(i64, f64)>,
+    points: Vec<(i64, Option<f64>)>,
 }
 
 /// `GET /api/series`: resolve the locator and return the series' unit plus the
