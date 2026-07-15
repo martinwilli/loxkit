@@ -12,10 +12,11 @@
 # meaning; everything else takes a sensible default.
 #
 # Every bound series is bucketed onto the same dense grid so a panel's stack
-# lines up. `gapfill` picks how an empty bucket fills, and defaults to `none`
-# (leave empty, read as 0). Set `locf` to carry the last value across a gap (a
-# level like a temperature or a valve position), or `interpolate` to ramp
-# between points (a coarsely sampled smooth signal).
+# lines up. `gapfill` picks how an empty bucket fills. The default depends on the
+# series: a line carries the last value (`locf`), while a bar or a delta/integral
+# reads as 0 (`none`). Set it explicitly to override -- `locf` to hold a level
+# across a gap (a temperature or a valve position), `interpolate` to ramp between
+# points (a coarsely sampled smooth signal), or `none` to leave empties at 0.
 
 views:
   # A short window. Panels mix bars and lines, pin series to their own axes,
