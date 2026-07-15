@@ -382,6 +382,12 @@
     range: { kind: "rel", spec: DEFAULT_RANGE },
   };
 
+  // Per-view data floor (earliest sample, epoch ms) fetched from api/extent and
+  // cached by view id. A number clamps the padded window's left edge; null means
+  // the view has no data; undefined means not fetched yet (treated as no clamp).
+  // The floor only moves on first-ever ingest, so a session-lifetime cache is fine.
+  var viewFloors = {};
+
   function currentView() {
     for (var i = 0; i < state.views.length; i += 1) {
       if (state.views[i].id === state.viewId) {
@@ -389,6 +395,12 @@
       }
     }
     return state.views[0] || null;
+  }
+
+  // The current view's floor as a number, or null when unknown/absent.
+  function currentFloor() {
+    var f = viewFloors[state.viewId];
+    return typeof f === "number" ? f : null;
   }
 
   // Resolve the effective [from,to] ms window from the range state and clock.
@@ -422,11 +434,16 @@
 
   function padWindow(win) {
     var pad = (win.to - win.from) * ZOOM_PAD;
-    // Don't pad past the present: a right margin beyond now would expose empty
-    // future space, or stray future-dated points. Clamp the right edge to now;
-    // the left margin (and any window already sitting in the past) is untouched.
+    // Don't pad past the data on either side. On the right, a margin beyond now
+    // would expose empty future space or stray future-dated points, so clamp to
+    // now. On the left, symmetrically, don't open before the view's earliest
+    // sample (currentFloor): the pre-data region gapfills to blanks and there is
+    // nothing to reveal there. An unknown floor (not yet fetched) leaves the left
+    // margin untouched, i.e. the pre-clamp behavior.
+    var floor = currentFloor();
+    var left = Math.round(win.from - pad);
     return {
-      from: Math.round(win.from - pad),
+      from: floor !== null ? Math.max(left, floor) : left,
       to: Math.min(Math.round(win.to + pad), Date.now()),
     };
   }
@@ -529,6 +546,30 @@
       }
       return resp.json();
     });
+  }
+
+  // Fetch and cache a view's data floor (earliest sample) into viewFloors. Best
+  // effort and fire-and-forget: rendering never waits on it, since the floor only
+  // bites once a zoom-out reaches deep history (the default window's left pad sits
+  // well after any real floor). A view already cached (even as null) is left be; a
+  // failed fetch leaves the entry unset so a later visit retries.
+  function loadFloor(viewId) {
+    if (!viewId || Object.prototype.hasOwnProperty.call(viewFloors, viewId)) {
+      return;
+    }
+    fetch("api/extent?view=" + encodeURIComponent(viewId))
+      .then(function (resp) {
+        if (!resp.ok) {
+          throw new Error("api/extent HTTP " + resp.status);
+        }
+        return resp.json();
+      })
+      .then(function (data) {
+        viewFloors[viewId] = typeof data.floor_ms === "number" ? data.floor_ms : null;
+      })
+      .catch(function () {
+        // Leave it unset; the left clamp is a best-effort nicety, not required.
+      });
   }
 
   function fetchSeries(viewId, panelIdx, seriesIdx, win, signal) {
@@ -839,11 +880,15 @@
         // note whether padWindow clamped the right edge to now: if it did there
         // is no newer data to reveal, so zoomRestingInLoaded must not treat a
         // window flush against that edge as "wants more" (it is flush from the
-        // very first load of a recent-data view).
+        // very first load of a recent-data view). The left edge mirrors it:
+        // __padLeftAtFloor records whether padWindow clamped to the data floor,
+        // so a zoom-out resting on the oldest sample doesn't chase older data.
         chart.__padWin = padWin;
         chart.__loadedKey = bucketWidth(padWin.to - padWin.from);
         chart.__padRightAtNow =
           padWin.to < Math.round(win.to + (win.to - win.from) * ZOOM_PAD);
+        chart.__padLeftAtFloor =
+          padWin.from > Math.round(win.from - (win.to - win.from) * ZOOM_PAD);
         suppressZoom = true;
         chart.setOption(buildPanelOption(panel, seriesData, win, padWin, dbUnits), {
           notMerge: true,
@@ -943,8 +988,10 @@
   // axis is pinned to the padded extent, so wheeling out saturates flush against
   // it and a bare "within loaded" test would always hold and dead-end the zoom.
   // Once the window eats into the last sliver of margin we refetch a wider
-  // window instead. The right edge is exempt when the load clamped it to now
-  // (__padRightAtNow) -- there is nothing newer to reveal there. Conservative --
+  // window instead. Each edge is exempt when the load clamped it to the data:
+  // the right when it hit now (__padRightAtNow, nothing newer to reveal), the
+  // left when it hit the view floor (__padLeftAtFloor, nothing older) -- else a
+  // zoom-out parked on the oldest sample would requery forever. Conservative --
   // a chart that hasn't loaded (no __padWin) forces a reload rather than risk
   // showing stale resolution.
   function zoomRestingInLoaded() {
@@ -959,7 +1006,7 @@
       if (!c.__padWin || c.__loadedKey !== key) {
         return false;
       }
-      var leftOk = win.from - c.__padWin.from >= slack;
+      var leftOk = c.__padLeftAtFloor || win.from - c.__padWin.from >= slack;
       var rightOk = c.__padRightAtNow || c.__padWin.to - win.to >= slack;
       return leftOk && rightOk;
     });
@@ -1009,6 +1056,7 @@
           return;
         }
         state.viewId = v.id;
+        loadFloor(v.id); // cache the new view's data floor for the left clamp
         applyViewDefaultRange(); // switching a view adopts its default window
         writeUrl();
         renderTabs();
@@ -1063,6 +1111,7 @@
         if (!state.viewId || !currentView()) {
           state.viewId = state.views.length ? state.views[0].id : null;
         }
+        loadFloor(state.viewId); // cache the initial view's floor (non-blocking)
         if (!state.range) {
           applyViewDefaultRange();
         }
