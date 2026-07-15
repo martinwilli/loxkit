@@ -673,9 +673,10 @@
       };
       if (s.stack) {
         opt.stack = s.stack;
-        // samesign: positive values stack up, negative (scale:-1) stack down,
-        // so a mirrored series lands below zero within its group.
-        opt.stackStrategy = "samesign";
+        // samesign (default): positive values stack up, negative (scale:-1)
+        // stack down, so a mirrored series lands below zero within its group.
+        // "all" stacks across signs, for a band whose base dips below zero.
+        opt.stackStrategy = s.stack_strategy || "samesign";
       }
       if (opt.type === "line") {
         var mode = INTERP[s.interp] || INTERP.linear;

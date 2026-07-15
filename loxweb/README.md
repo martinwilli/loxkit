@@ -64,6 +64,7 @@ views:
 | `type` | `line` (default) or `bar`; may be mixed in one panel. |
 | `axis` | Which declared axis `id` the series is drawn against. |
 | `stack` | Series sharing a group stack together; a `scale: -1` series stacks below zero within its group. |
+| `stack_strategy` | `samesign` (default) keeps mirrored (`scale: -1`) members below zero; `all` stacks across signs, for a min-max band whose base goes negative. |
 | `scale` | Multiplier applied to every value, e.g. `-1` to mirror or `0.001` to rescale units. |
 | `color` | A CSS color; absent uses the default palette. |
 | `interp` | `linear` (default), `smooth`, or `step`. |

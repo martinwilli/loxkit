@@ -141,6 +141,11 @@ pub struct Series {
     /// Stack group; series sharing a group stack together.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack: Option<String>,
+    /// How this series accumulates within its stack group. Absent is `samesign`
+    /// (a mirrored `scale: -1` member stacks below zero); set `all` to stack
+    /// across signs, e.g. for a min-max band whose base goes negative.
+    #[serde(default)]
+    pub stack_strategy: StackStrategy,
     /// Multiplier applied to values, e.g. `-1` to mirror below zero or `0.001`
     /// to rescale units.
     #[serde(default = "default_scale")]
@@ -429,6 +434,21 @@ pub enum Interp {
     Smooth,
     /// Step (hold last value), e.g. for a valve position.
     Step,
+}
+
+/// How a series accumulates within its [`Series::stack`] group. Maps straight to
+/// the charting library's stack strategy of the same names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StackStrategy {
+    /// Positive and negative values accumulate on their own side of zero (the
+    /// default), so a `scale: -1` member lands below zero within the group.
+    #[default]
+    Samesign,
+    /// Accumulate across signs. Needed for a min-max band, whose base (the daily
+    /// `min`) can dip below zero: the `max - min` height must stack onto that
+    /// negative base to reach `max`, which `samesign` refuses.
+    All,
 }
 
 /// The aggregation applied when bucketing a bound series. No default: an absent
@@ -974,7 +994,7 @@ views:
           - {label: COP, expr: "heat / power", type: line, axis: ratio, interp: smooth}
       - title: Live
         series:
-          - {id: prod, label: Production,  uuid: "deadbeef-0000-0000-0000-000000000004", sub: prodCurrDay, agg: max, type: bar, stack: gen}
+          - {id: prod, label: Production,  uuid: "deadbeef-0000-0000-0000-000000000004", sub: prodCurrDay, agg: max, type: bar, stack: gen, stack_strategy: all}
           - {id: cons, label: Consumption, uuid: "deadbeef-0000-0000-0000-000000000005", sub: consCurrDay, agg: max, type: bar, stack: use, scale: -1}
           - {label: Net, expr: "prod + cons", type: line, interp: smooth}
   - id: yearly
@@ -1014,6 +1034,7 @@ views:
         assert_eq!(heat.resolved_sub(), "total");
         assert_eq!(heat.scale, 1.0);
         assert_eq!(heat.interp, Interp::Linear);
+        assert_eq!(heat.stack_strategy, StackStrategy::Samesign);
 
         // sub omitted -> DEFAULT_SUB; agg deferred as None.
         let temp = &heating.series[2];
@@ -1031,6 +1052,11 @@ views:
         let cons = &dbs.views[0].panels[1].series[1];
         assert_eq!(cons.scale, -1.0);
         assert_eq!(cons.stack.as_deref(), Some("use"));
+        assert_eq!(cons.stack_strategy, StackStrategy::Samesign);
+
+        // A stack member that opts into across-sign accumulation.
+        let prod = &dbs.views[0].panels[1].series[0];
+        assert_eq!(prod.stack_strategy, StackStrategy::All);
 
         // The derived Net references two siblings by id.
         let net = &dbs.views[0].panels[1].series[2];
