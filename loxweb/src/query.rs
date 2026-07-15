@@ -31,11 +31,12 @@
 //! * `1 hour ≤ ideal < 1 day` → `readings_1h`, snapped up the whole-hour ladder.
 //! * `ideal ≥ 1 day` → `readings_1d`, snapped up the whole-day ladder (capped).
 //!
-//! Two aggregations override the tier: `delta` and `median` need per-point data
-//! the caggs don't carry, so they force the raw tier regardless of span while
-//! keeping the span-appropriate bucket width. `delta` is last-minus-first over
-//! the bucket and the caggs store `last_val` but no `first_val` to compose it
-//! from; a percentile can't be composed from bucket rollups at all.
+//! One aggregation overrides the tier: `median` needs per-point data the caggs
+//! don't carry, so it forces the raw tier regardless of span while keeping the
+//! span-appropriate bucket width — a percentile can't be composed from bucket
+//! rollups at all. (`delta` used to force raw too, but the caggs now carry
+//! `first_val` beside `last_val`, so it rolls up as
+//! `last(last_val) - first(first_val)` off the coarse tiers.)
 //!
 //! A `bucket` on a view/panel overrides the span router. It is either the scalar
 //! `day`/`month` calendar shorthand or a zoom-driven **schedule** — an array of
@@ -46,8 +47,8 @@
 //! from `readings_1h` (hour boundaries nest cleanly into local days/months;
 //! `readings_1d`'s UTC-midnight days straddle both), while a clock unit (`s`/`m`/
 //! `h`) buckets in plain wall time — sub-minute widths from raw `readings`, hours
-//! from `readings_1h`. The raw-only aggregations (`delta`/`median`) always source
-//! from raw regardless. loxweb only *reads* the pinned zone; the daemon's sink is
+//! from `readings_1h`. The raw-only aggregation (`median`) always sources from
+//! raw regardless. loxweb only *reads* the pinned zone; the daemon's sink is
 //! what `ALTER DATABASE … SET TimeZone` once.
 
 use std::time::SystemTime;
@@ -199,13 +200,12 @@ impl Tier {
 }
 
 /// Whether an aggregation can only be computed from raw per-point data. The
-/// caggs carry `(n, s, vmin, vmax, last_val, tw)`: `delta` is last-minus-first
-/// but there is no `first_val` to pair with the stored `last_val`, and a
-/// percentile can't be composed from bucket rollups at all — so `delta` and
-/// `median` always read raw. (Adding `first_val` to the caggs would let `delta`
-/// roll up as `last(last_val) - first(first_val)`; deferred.)
+/// caggs carry `(n, s, vmin, vmax, first_val, last_val, tw)`, so `delta`
+/// composes on the tiers as `last(last_val) - first(first_val)`. A percentile
+/// can't be composed from bucket rollups at all, so `median` alone forces the
+/// raw tier.
 fn is_raw_only(agg: Agg) -> bool {
-    matches!(agg, Agg::Delta | Agg::Median)
+    matches!(agg, Agg::Median)
 }
 
 /// The first ladder step at least as wide as `ideal`, or the widest step when
@@ -239,7 +239,7 @@ fn route(agg: Agg, span_secs: u64) -> (Tier, &'static str) {
 }
 
 /// The per-tier SQL value expression for an aggregation. The cagg branch never
-/// sees `delta`/`median` because [`route`] forces those onto the raw tier.
+/// sees `median` because [`route`] forces a percentile onto the raw tier.
 fn value_expr(agg: Agg, tier: Tier) -> &'static str {
     match tier {
         Tier::Raw => match agg {
@@ -269,12 +269,16 @@ fn value_expr(agg: Agg, tier: Tier) -> &'static str {
             Agg::Max => "max(vmax)",
             Agg::Min => "min(vmin)",
             Agg::Last => "last(last_val, bucket)",
+            // Net change over the bucket, composed from the stored brackets:
+            // the same last-minus-first as raw, so it ignores intra-bucket
+            // float-ULP wobble identically (see the raw branch's reasoning).
+            Agg::Delta => "last(last_val, bucket) - first(first_val, bucket)",
             // toolkit: rollup() composes the stored tw partials, integral()
             // finalizes; identical result to the raw path. Signature per
             // toolkit 1.23.0, verify live.
             Agg::Integral => "integral(rollup(tw))",
-            Agg::Median | Agg::Delta => {
-                unreachable!("delta/median force the raw tier in route()")
+            Agg::Median => {
+                unreachable!("median forces the raw tier in route()")
             }
         },
     }
@@ -624,16 +628,16 @@ mod tests {
         );
     }
 
-    // --- the delta/median raw-force override ---
+    // --- delta rolls up on the caggs (first_val); median stays raw-only ---
 
     #[test]
-    fn delta_forces_raw_even_on_a_huge_span() {
-        // 1000 days would route to readings_1d (1-day buckets), but a counter
-        // delta must read raw; the 1-day width is kept.
+    fn delta_rolls_up_on_readings_1d_over_a_huge_span() {
+        // 1000 days routes to readings_1d; delta composes on the tier as
+        // last(last_val) - first(first_val), the same net change as raw.
         assert_eq!(
             sql_for_span(Agg::Delta, 1_000 * DAY_SECS),
-            "SELECT time_bucket_gapfill('1 day', ts, $2::timestamptz, $3::timestamptz) AS bucket, last(value, ts) - first(value, ts) AS value \
-             FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
+            "SELECT time_bucket_gapfill('1 day', bucket, $2::timestamptz, $3::timestamptz) AS bucket, last(last_val, bucket) - first(first_val, bucket) AS value \
+             FROM readings_1d WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
     }
 
@@ -668,9 +672,9 @@ mod tests {
     }
 
     #[test]
-    fn day_for_delta_sources_from_raw() {
-        // delta is raw-only, so a daily counter bucket reads raw with the same
-        // tz-aware time_bucket_gapfill over ts.
+    fn day_for_delta_rolls_up_from_readings_1h() {
+        // delta composes on the caggs, so a daily counter bucket rolls up from
+        // readings_1h with the same tz-aware time_bucket_gapfill over bucket.
         let sql = build_sql(
             Agg::Delta,
             Gapfill::None,
@@ -679,9 +683,9 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT time_bucket_gapfill('1 day', ts, current_setting('TimeZone'), $2::timestamptz, $3::timestamptz) AS bucket, \
-             last(value, ts) - first(value, ts) AS value \
-             FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
+            "SELECT time_bucket_gapfill('1 day', bucket, current_setting('TimeZone'), $2::timestamptz, $3::timestamptz) AS bucket, \
+             last(last_val, bucket) - first(first_val, bucket) AS value \
+             FROM readings_1h WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
     }
 
@@ -704,9 +708,9 @@ mod tests {
     }
 
     #[test]
-    fn month_for_delta_sources_from_raw() {
-        // delta is raw-only, so a monthly counter bucket reads raw with the same
-        // tz-aware time_bucket_gapfill over ts.
+    fn month_for_delta_rolls_up_from_readings_1h() {
+        // delta composes on the caggs, so a monthly counter bucket rolls up from
+        // readings_1h with the same tz-aware time_bucket_gapfill over bucket.
         let sql = build_sql(
             Agg::Delta,
             Gapfill::None,
@@ -715,9 +719,9 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT time_bucket_gapfill('1 month', ts, current_setting('TimeZone'), $2::timestamptz, $3::timestamptz) AS bucket, \
-             last(value, ts) - first(value, ts) AS value \
-             FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
+            "SELECT time_bucket_gapfill('1 month', bucket, current_setting('TimeZone'), $2::timestamptz, $3::timestamptz) AS bucket, \
+             last(last_val, bucket) - first(first_val, bucket) AS value \
+             FROM readings_1h WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
     }
 
@@ -789,14 +793,14 @@ mod tests {
     }
 
     #[test]
-    fn schedule_month_width_for_delta_sources_from_raw() {
-        // 3y span -> the 1M rule: a calendar width, but delta is raw-only, so
-        // tz-aware bucketing over raw ts.
+    fn schedule_month_width_for_delta_rolls_up_from_readings_1h() {
+        // 3y span -> the 1M rule: a calendar width, and delta now composes on the
+        // caggs, so tz-aware bucketing rolls up from readings_1h.
         assert_eq!(
             sched_sql(Agg::Delta, 3 * 365 * DAY_SECS),
-            "SELECT time_bucket_gapfill('1 month', ts, current_setting('TimeZone'), $2::timestamptz, $3::timestamptz) AS bucket, \
-             last(value, ts) - first(value, ts) AS value \
-             FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
+            "SELECT time_bucket_gapfill('1 month', bucket, current_setting('TimeZone'), $2::timestamptz, $3::timestamptz) AS bucket, \
+             last(last_val, bucket) - first(first_val, bucket) AS value \
+             FROM readings_1h WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
     }
 
