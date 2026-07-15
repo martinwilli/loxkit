@@ -132,10 +132,18 @@ pub struct SeriesRequest {
     /// The chart type, used only to resolve the gapfill default (a bar's empty
     /// buckets zero-fill, a line's carry forward). Never enters the SQL.
     pub kind: SeriesType,
-    /// Inclusive start of the window.
+    /// Inclusive start of the (padded) window actually scanned and gapfilled.
     pub from: SystemTime,
-    /// Exclusive end of the window.
+    /// Exclusive end of the scanned window.
     pub to: SystemTime,
+    /// Inclusive start of the visible window the user sees. Its span — not the
+    /// scanned `[from, to]` — picks the bucket width and source tier, so the
+    /// visible slice hits the target point count no matter how far the fetch is
+    /// padded past it for scroll-out margin. Defaults to `from` when the caller
+    /// sends no separate visible window.
+    pub vis_from: SystemTime,
+    /// Exclusive end of the visible window; defaults to `to`.
+    pub vis_to: SystemTime,
     /// The bucketing policy (scalar `day`/`month` or a zoom-driven schedule), or
     /// `None` to tier-route by span.
     pub bucket: Option<BucketSpec>,
@@ -273,19 +281,17 @@ fn value_expr(agg: Agg, tier: Tier) -> &'static str {
 }
 
 /// Build the parametrized SQL for a request. **Pure and DB-free**: the returned
-/// string is a deterministic function of `(agg, gapfill, span, bucket)`. The uuid
-/// and the two time bounds bind as `$1`/`$2`/`$3` in that order; everything else
-/// is chosen from the enums/ladders and safely inlined.
+/// string is a deterministic function of `(agg, gapfill, span_secs, bucket)`. The
+/// `span_secs` is the *visible* window's span — the width/tier follow what the
+/// user sees, decoupled from the possibly-wider `[$2, $3)` actually scanned. The
+/// uuid and the two time bounds bind as `$1`/`$2`/`$3` in that order; everything
+/// else is chosen from the enums/ladders and safely inlined.
 fn build_sql(
     agg: Agg,
     gapfill: Gapfill,
-    from: SystemTime,
-    to: SystemTime,
+    span_secs: u64,
     bucket: Option<&BucketSpec>,
 ) -> String {
-    // A reversed range degenerates to a zero span (finest bucket, empty result).
-    let span_secs = to.duration_since(from).map(|d| d.as_secs()).unwrap_or(0);
-
     // Every query gapfills onto a fixed grid spanning [$2, $3): a dashboard
     // panel stacks series index-for-index, so they must share the same bucket
     // set. Emitting only non-empty buckets (different per series) is what breaks
@@ -440,7 +446,15 @@ pub async fn query_series(pool: &Pool, req: &SeriesRequest) -> Result<SeriesResu
     let gapfill = req
         .gapfill
         .unwrap_or_else(|| default_gapfill(agg, req.kind));
-    let sql = build_sql(agg, gapfill, req.from, req.to, req.bucket.as_ref());
+    // Width/tier follow the VISIBLE window's span; [from, to] (the padded window)
+    // still binds $2/$3 and bounds the gapfill grid. A reversed range degenerates
+    // to a zero span (finest bucket, empty result).
+    let span_secs = req
+        .vis_to
+        .duration_since(req.vis_from)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let sql = build_sql(agg, gapfill, span_secs, req.bucket.as_ref());
     let rows = client
         .query(&sql, &[&req.uuid, &req.from, &req.to])
         .await
@@ -497,22 +511,11 @@ mod tests {
 
     use crate::dashboard::{Bucket, BucketInterval, BucketRule};
 
-    /// A stable instant, so expected SQL is deterministic.
-    fn t(secs: u64) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(secs)
-    }
-
     /// SQL for a span of `span_secs`, span-routed (no calendar bucket). Passes
     /// `Gapfill::None` (the default) so these assert the bare per-tier aggregate;
     /// the `locf`/`interpolate` wrappers have their own tests below.
     fn sql_for_span(agg: Agg, span_secs: u64) -> String {
-        build_sql(
-            agg,
-            Gapfill::None,
-            t(1_600_000_000),
-            t(1_600_000_000 + span_secs),
-            None,
-        )
+        build_sql(agg, Gapfill::None, span_secs, None)
     }
 
     // --- one query per agg class on the raw tier (a 1-hour span → 5s) ---
@@ -653,8 +656,7 @@ mod tests {
         let sql = build_sql(
             Agg::Max,
             Gapfill::None,
-            t(1_600_000_000),
-            t(1_700_000_000),
+            100_000_000,
             Some(&BucketSpec::Fixed(Bucket::Day)),
         );
         assert_eq!(
@@ -672,8 +674,7 @@ mod tests {
         let sql = build_sql(
             Agg::Delta,
             Gapfill::None,
-            t(1_600_000_000),
-            t(1_700_000_000),
+            100_000_000,
             Some(&BucketSpec::Fixed(Bucket::Day)),
         );
         assert_eq!(
@@ -691,8 +692,7 @@ mod tests {
         let sql = build_sql(
             Agg::Integral,
             Gapfill::None,
-            t(1_600_000_000),
-            t(1_700_000_000),
+            100_000_000,
             Some(&BucketSpec::Fixed(Bucket::Month)),
         );
         assert_eq!(
@@ -710,8 +710,7 @@ mod tests {
         let sql = build_sql(
             Agg::Delta,
             Gapfill::None,
-            t(1_600_000_000),
-            t(1_700_000_000),
+            100_000_000,
             Some(&BucketSpec::Fixed(Bucket::Month)),
         );
         assert_eq!(
@@ -752,13 +751,7 @@ mod tests {
 
     /// SQL for a span under the given schedule, bare aggregate (Gapfill::None).
     fn sched_sql(agg: Agg, span_secs: u64) -> String {
-        build_sql(
-            agg,
-            Gapfill::None,
-            t(1_600_000_000),
-            t(1_600_000_000 + span_secs),
-            Some(&sched()),
-        )
+        build_sql(agg, Gapfill::None, span_secs, Some(&sched()))
     }
 
     #[test]
@@ -844,13 +837,7 @@ mod tests {
         // A held level (a temperature, a valve) opts into locf so an empty bucket
         // carries the previous value instead of reading 0. It is no longer a
         // default: an absent gapfill is None (see the bare-aggregate tests above).
-        let sql = build_sql(
-            Agg::Avg,
-            Gapfill::Locf,
-            t(1_600_000_000),
-            t(1_600_003_600),
-            None,
-        );
+        let sql = build_sql(Agg::Avg, Gapfill::Locf, 3_600, None);
         assert_eq!(
             sql,
             "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
@@ -863,13 +850,7 @@ mod tests {
     fn interpolate_override_ramps_between_points() {
         // An explicit interpolate wraps the value in interpolate(), for a
         // smoothly-varying, coarsely-sampled signal (an absent gapfill is none).
-        let sql = build_sql(
-            Agg::Avg,
-            Gapfill::Interpolate,
-            t(1_600_000_000),
-            t(1_600_003_600),
-            None,
-        );
+        let sql = build_sql(Agg::Avg, Gapfill::Interpolate, 3_600, None);
         assert_eq!(
             sql,
             "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
@@ -882,13 +863,7 @@ mod tests {
     fn none_override_leaves_a_gauge_bare() {
         // none is the default; on a gauge it leaves the bare aggregate, and an
         // empty bucket reads 0 when rows are mapped.
-        let sql = build_sql(
-            Agg::Avg,
-            Gapfill::None,
-            t(1_600_000_000),
-            t(1_600_003_600),
-            None,
-        );
+        let sql = build_sql(Agg::Avg, Gapfill::None, 3_600, None);
         assert_eq!(
             sql,
             "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
@@ -988,6 +963,8 @@ mod tests {
                 kind: SeriesType::Line,
                 from,
                 to,
+                vis_from: from,
+                vis_to: to,
                 bucket: None,
             };
             let result = query_series(&pool, &req).await.expect("query series");
