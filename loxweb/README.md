@@ -73,8 +73,10 @@ views:
 ### Axes
 
 Up to three y-axes per panel. Each has an `id` (referenced by `series.axis`), a
-`side` (`left`/`right`), an optional `unit` label, and optional `min`/`max`. A
-panel with no `axes` gets a single implicit axis.
+`side` (`left`/`right`), an optional `unit` label, and optional `min`/`max`. By
+default a value axis includes the zero baseline; set `scale: true` to let it hug
+the data range instead (an explicit `min`/`max` still pins that bound). A panel
+with no `axes` gets a single implicit axis.
 
 ### Bucketing
 

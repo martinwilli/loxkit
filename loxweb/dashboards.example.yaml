@@ -38,8 +38,9 @@ views:
             unit: "%"
             min: 0
             max: 100
-          - id: ratio            # unitless, third axis
+          - id: ratio            # unitless third axis; hug the data, no zero baseline
             side: right
+            scale: true
         series:
           - id: t_in
             label: Indoor Temp

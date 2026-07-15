@@ -608,6 +608,9 @@
           name: ax.unit || axisStoreUnit[i] || "",
           min: ax.min !== undefined ? ax.min : null,
           max: ax.max !== undefined ? ax.max : null,
+          // Default (scale:false) keeps ECharts' zero baseline; scale:true lets
+          // the axis hug the data range instead.
+          scale: !!ax.scale,
           nameTextStyle: { color: chrome.ink2 },
           axisLine: { lineStyle: { color: chrome.axis } },
           axisLabel: { color: chrome.muted },
