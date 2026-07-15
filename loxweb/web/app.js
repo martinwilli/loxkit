@@ -394,7 +394,9 @@
   // Resolve the effective [from,to] ms window from the range state and clock.
   function resolveWindow() {
     if (state.range.kind === "abs") {
-      return { from: state.range.from, to: state.range.to };
+      // A bookmarked or hand-edited URL could carry a `to` past now; clamp it so
+      // an absolute window can't open into the future either.
+      return { from: state.range.from, to: Math.min(state.range.to, Date.now()) };
     }
     var w = parseRange(state.range.spec, Date.now());
     return w || parseRange(DEFAULT_RANGE, Date.now());
@@ -413,7 +415,13 @@
 
   function padWindow(win) {
     var pad = (win.to - win.from) * ZOOM_PAD;
-    return { from: Math.round(win.from - pad), to: Math.round(win.to + pad) };
+    // Don't pad past the present: a right margin beyond now would expose empty
+    // future space, or stray future-dated points. Clamp the right edge to now;
+    // the left margin (and any window already sitting in the past) is untouched.
+    return {
+      from: Math.round(win.from - pad),
+      to: Math.min(Math.round(win.to + pad), Date.now()),
+    };
   }
 
   // A client-side mirror of the server tier router (query.rs route/snap): map a
