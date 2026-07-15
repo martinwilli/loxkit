@@ -90,7 +90,8 @@ pub fn router(store: Arc<DashboardStore>, pool: Pool, base_path: &str) -> Router
         .route(&prefixed("/style.css"), get(style_css))
         .route(&prefixed("/echarts.min.js"), get(echarts_js))
         .route(&prefixed("/api/views"), get(get_views))
-        .route(&prefixed("/api/series"), get(get_series));
+        .route(&prefixed("/api/series"), get(get_series))
+        .route(&prefixed("/api/extent"), get(get_extent));
 
     router = if base.is_empty() {
         router.route("/", get(index))
@@ -190,6 +191,64 @@ async fn get_series(
         unit: result.unit,
         points,
     }))
+}
+
+/// Query parameters for `GET /api/extent`.
+#[derive(Debug, Deserialize)]
+struct ExtentQuery {
+    /// View id.
+    view: String,
+}
+
+/// The `GET /api/extent` response: the view's data floor as Unix epoch
+/// milliseconds, or `null` when no series in the view has any data yet. The
+/// frontend clamps a zoom-out's left edge to it.
+#[derive(Debug, Serialize)]
+struct ExtentResponse {
+    floor_ms: Option<i64>,
+}
+
+/// `GET /api/extent`: the earliest sample timestamp across all of a view's bound
+/// series, so the frontend can stop a zoom-out at the first data point. An
+/// unknown view is a 404; a query failure is logged and surfaces as a 500.
+async fn get_extent(
+    State(state): State<AppState>,
+    Query(q): Query<ExtentQuery>,
+) -> Result<Json<ExtentResponse>, ApiError> {
+    // Resolve the uuid set against a snapshot, then drop it before the await.
+    let uuids = {
+        let dash = state.store.current();
+        view_bound_uuids(&dash, &q.view)?
+    };
+    let floor = query::query_view_floor(&state.pool, &uuids)
+        .await
+        .map_err(|e| {
+            let cause = format!("{e:#}");
+            error!(error = %cause, view = %q.view, "extent query failed");
+            ApiError::Internal
+        })?;
+    Ok(Json(ExtentResponse {
+        floor_ms: floor.map(systemtime_to_ms),
+    }))
+}
+
+/// Collect every bound series' uuid in a view (derived `expr` series carry no
+/// uuid and are skipped). An unknown view is a 404. A uuid that won't parse is
+/// dropped rather than failing the whole lookup: the floor is a best-effort
+/// hint, so one bad config entry shouldn't blank it for the rest.
+fn view_bound_uuids(dash: &Dashboards, view: &str) -> Result<Vec<Uuid>, ApiError> {
+    let view = dash
+        .views
+        .iter()
+        .find(|v| v.id == view)
+        .ok_or_else(|| ApiError::NotFound(format!("unknown view '{view}'")))?;
+    Ok(view
+        .panels
+        .iter()
+        .flat_map(|p| p.series.iter())
+        .filter_map(|s| s.uuid.as_deref())
+        .filter_map(|u| Uuid::parse_str(u).ok())
+        .collect())
 }
 
 /// Locate a series by `(view, panel, series)` and build its [`SeriesRequest`].
@@ -499,6 +558,34 @@ views:
         ));
         assert!(matches!(
             resolve_request(&dash, "main", 0, 9, 0, 1).unwrap_err(),
+            ApiError::NotFound(_)
+        ));
+    }
+
+    // --- view_bound_uuids (pure) ---
+
+    #[test]
+    fn bound_uuids_collect_bound_and_skip_derived() {
+        let dash = dashboards();
+        // main has one bound series (uuid ...001) and one derived (expr a+1).
+        assert_eq!(
+            view_bound_uuids(&dash, "main").unwrap(),
+            vec![Uuid::parse_str("deadbeef-0000-0000-0000-000000000001").unwrap()]
+        );
+    }
+
+    #[test]
+    fn bound_uuids_drop_an_unparseable_uuid() {
+        let dash = dashboards();
+        // bad's only series carries "not-a-uuid": dropped, not fatal.
+        assert!(view_bound_uuids(&dash, "bad").unwrap().is_empty());
+    }
+
+    #[test]
+    fn bound_uuids_unknown_view_is_not_found() {
+        let dash = dashboards();
+        assert!(matches!(
+            view_bound_uuids(&dash, "nope").unwrap_err(),
             ApiError::NotFound(_)
         ));
     }

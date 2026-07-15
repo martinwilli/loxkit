@@ -461,6 +461,35 @@ pub async fn query_series(pool: &Pool, req: &SeriesRequest) -> Result<SeriesResu
     })
 }
 
+/// The earliest sample timestamp across a set of series, or `None` when the set
+/// is empty or none of them has any data yet. This is a view's "floor": the
+/// frontend clamps a zoom-out's left edge to it so the window can't open before
+/// the first data point, the way the right edge clamps to the present.
+///
+/// Cheap regardless of table size. The lateral pulls one row per uuid straight
+/// off the `readings (uuid, ts DESC)` index (an ordered index scan read backward
+/// for the oldest, `LIMIT 1`), then the outer `min` reduces the handful of
+/// per-series firsts. There is no retention policy, so raw `readings` still holds
+/// the true earliest point for every series.
+pub async fn query_view_floor(pool: &Pool, uuids: &[Uuid]) -> Result<Option<SystemTime>> {
+    if uuids.is_empty() {
+        return Ok(None);
+    }
+    let client = pool.get().await.context("getting a read connection")?;
+    let row = client
+        .query_one(
+            "SELECT min(f.ts) \
+             FROM unnest($1::uuid[]) AS q(uuid) \
+             CROSS JOIN LATERAL ( \
+                 SELECT ts FROM readings WHERE uuid = q.uuid ORDER BY ts LIMIT 1 \
+             ) AS f",
+            &[&uuids],
+        )
+        .await
+        .context("querying the view floor")?;
+    Ok(row.get::<_, Option<SystemTime>>(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
