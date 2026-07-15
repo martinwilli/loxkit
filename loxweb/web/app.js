@@ -413,6 +413,13 @@
   // a redraw (see buildPanelOption and onZoom).
   var ZOOM_PAD = 0.5;
 
+  // A zoom-out saturates flush against the padded extent (the axis is pinned to
+  // it), so "still inside the loaded window" holds trivially and would dead-end
+  // the zoom. zoomRestingInLoaded instead requires this fraction of the visible
+  // span as unused margin before it skips the requery; once the window eats into
+  // that margin, a wider window is fetched. Keep well below ZOOM_PAD.
+  var ZOOM_SLACK = 0.05;
+
   function padWindow(win) {
     var pad = (win.to - win.from) * ZOOM_PAD;
     // Don't pad past the present: a right margin beyond now would expose empty
@@ -828,9 +835,15 @@
         // zoom's percentages against the window actually on screen (a burst of
         // ticks all map against this, not against the drifting state.range), and
         // the rung this data was fetched at, so a later zoom can tell whether a
-        // requery would change the resolution (see zoomRestingInLoaded).
+        // requery would change the resolution (see zoomRestingInLoaded). Also
+        // note whether padWindow clamped the right edge to now: if it did there
+        // is no newer data to reveal, so zoomRestingInLoaded must not treat a
+        // window flush against that edge as "wants more" (it is flush from the
+        // very first load of a recent-data view).
         chart.__padWin = padWin;
         chart.__loadedKey = bucketWidth(padWin.to - padWin.from);
+        chart.__padRightAtNow =
+          padWin.to < Math.round(win.to + (win.to - win.from) * ZOOM_PAD);
         suppressZoom = true;
         chart.setOption(buildPanelOption(panel, seriesData, win, padWin, dbUnits), {
           notMerge: true,
@@ -921,11 +934,19 @@
   }
 
   // Whether a settled zoom needs no requery: every chart's new window still
-  // sits inside the padded extent its data was loaded at, AND that data was
-  // fetched at the same bucket rung this window would resolve to. Then the
-  // loaded series already cover the view at the right density and ECharts has
-  // rendered the client-side zoom. Conservative -- a chart that hasn't loaded
-  // (no __padWin) forces a reload rather than risk showing stale resolution.
+  // sits inside the padded extent its data was loaded at WITH scroll-out margin
+  // to spare, AND that data was fetched at the same bucket rung this window
+  // would resolve to. Then the loaded series already cover the view at the right
+  // density and ECharts has rendered the client-side zoom.
+  //
+  // The margin test (ZOOM_SLACK) is what lets a zoom-OUT eventually requery: the
+  // axis is pinned to the padded extent, so wheeling out saturates flush against
+  // it and a bare "within loaded" test would always hold and dead-end the zoom.
+  // Once the window eats into the last sliver of margin we refetch a wider
+  // window instead. The right edge is exempt when the load clamped it to now
+  // (__padRightAtNow) -- there is nothing newer to reveal there. Conservative --
+  // a chart that hasn't loaded (no __padWin) forces a reload rather than risk
+  // showing stale resolution.
   function zoomRestingInLoaded() {
     if (!charts.length) {
       return false;
@@ -933,13 +954,14 @@
     var win = resolveWindow();
     var pad = padWindow(win);
     var key = bucketWidth(pad.to - pad.from);
+    var slack = (win.to - win.from) * ZOOM_SLACK;
     return charts.every(function (c) {
-      return (
-        c.__padWin &&
-        c.__loadedKey === key &&
-        win.from >= c.__padWin.from &&
-        win.to <= c.__padWin.to
-      );
+      if (!c.__padWin || c.__loadedKey !== key) {
+        return false;
+      }
+      var leftOk = win.from - c.__padWin.from >= slack;
+      var rightOk = c.__padRightAtNow || c.__padWin.to - win.to >= slack;
+      return leftOk && rightOk;
     });
   }
 
