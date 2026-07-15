@@ -241,7 +241,7 @@ fn resolve_request(
         kind: series_ref.kind,
         from: ms_to_systemtime(from_ms),
         to: ms_to_systemtime(to_ms),
-        bucket: panel_ref.bucket.or(view.bucket),
+        bucket: panel_ref.bucket.clone().or_else(|| view.bucket.clone()),
     })
 }
 
@@ -294,7 +294,7 @@ mod tests {
     use loxtap::config::TimescaleConfig;
     use tower::ServiceExt as _;
 
-    use crate::dashboard::{Agg, Bucket};
+    use crate::dashboard::{Agg, Bucket, BucketSpec};
 
     /// A dashboards set exercising the resolver's branches: a bound and a derived
     /// series in one panel, a view-level calendar bucket, and a bad-uuid series.
@@ -466,7 +466,7 @@ views:
         // The yearly view carries bucket: month; its panel omits one, so the
         // request inherits it via panel.bucket.or(view.bucket).
         let req = resolve_request(&dash, "yearly", 0, 0, 0, 1).unwrap();
-        assert_eq!(req.bucket, Some(Bucket::Month));
+        assert_eq!(req.bucket, Some(BucketSpec::Fixed(Bucket::Month)));
         // sub omitted on the series -> the default value channel.
         assert_eq!(req.sub, "value");
         assert_eq!(req.agg, Some(Agg::Delta));

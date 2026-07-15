@@ -80,8 +80,31 @@ panel with no `axes` gets a single implicit axis.
 ### Bucketing
 
 The engine tier-routes by span: a wide window reads a coarse aggregate, a zoom
-re-queries a finer one automatically. The one exception is `bucket: month` on a
-view or panel, which buckets real calendar months in the store's local time.
+re-queries a finer one automatically. A `bucket` on a view or panel overrides
+that router. It takes two forms.
+
+**Scalar shorthand** — `bucket: day` or `bucket: month` pins real calendar days
+or months in the store's local time, so a daily-reset counter charted with `max`
+reads as one whole-day (or -month) total instead of fragmenting across sub-day
+buckets. Each is just a one-rule always-on schedule (below).
+
+**Schedule** — an array of `{upto, every}` rules that pick the bucket width from
+the current window span, so the resolution tracks the zoom you choose:
+
+```yaml
+bucket:
+  - {upto: 10h, every: 1m}    # span < 10 hours  -> 1-minute buckets
+  - {upto: 10d, every: 1h}    # span < 10 days   -> 1-hour buckets
+  - {upto: 10M, every: 1d}    # span < 10 months -> calendar days (local tz)
+  - {upto: 5y,  every: 1M}    # span < 5 years   -> calendar months (local tz)
+```
+
+Rules are matched in order: the first whose `upto` the span is **strictly below**
+wins; past the last rule the coarsest `every` clamps. Both `upto` and `every` use
+the compact `<count><unit>` grammar of `range` — `s`/`m`/`h`/`d`/`w`/`M`/`y`, with
+lowercase `m` minutes and uppercase `M` months. The `every` unit decides the rest:
+a **calendar** unit (`d`/`w`/`M`/`y`) buckets on local boundaries, a **clock** unit
+(`s`/`m`/`h`) in plain wall time. `upto` thresholds must strictly increase.
 
 ## Seeding synthetic data for the example
 

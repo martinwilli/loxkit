@@ -16,13 +16,15 @@
 //!   stays live, so an operator's typo never takes the dashboards down.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, bail};
 use arc_swap::ArcSwap;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tracing::{error, info};
 
 /// loxtap's default sub-channel: a control's primary state carries no sub-name
@@ -54,10 +56,12 @@ pub struct View {
     /// Auto-refresh cadence, e.g. `10s`, or `off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh: Option<String>,
-    /// Calendar-month bucketing for this view (the one calendar exception; else
-    /// the engine tier-routes by span). Inherited by panels that omit their own.
+    /// Bucketing policy for this view: the scalar shorthand `day`/`month` (a
+    /// fixed calendar unit), or a zoom-driven [`BucketSpec::Schedule`] that picks
+    /// the bucket width from the current window span. Absent means the engine
+    /// tier-routes by span. Inherited by panels that omit their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bucket: Option<Bucket>,
+    pub bucket: Option<BucketSpec>,
     /// The panels in this view.
     pub panels: Vec<Panel>,
 }
@@ -70,9 +74,10 @@ pub struct Panel {
     /// Relative height hint (grid rows); layout is otherwise automatic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
-    /// Calendar-month bucketing for this panel, overriding the view's.
+    /// Bucketing policy for this panel (scalar `day`/`month` or a
+    /// [`BucketSpec::Schedule`]), overriding the view's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bucket: Option<Bucket>,
+    pub bucket: Option<BucketSpec>,
     /// Declared y-axes; a series may target one by `id`. Empty means a single
     /// implicit axis.
     #[serde(default)]
@@ -170,13 +175,225 @@ impl Series {
     }
 }
 
-/// Calendar-month bucketing. `None` on a view/panel means the engine
-/// tier-routes by span; `month` is the single calendar exception.
+/// A fixed calendar bucket, the scalar shorthand of a [`BucketSpec`]: `day` and
+/// `month` are the two calendar exceptions the engine's span router skips, so a
+/// daily-reset counter charted with `max` reads as one whole-day (or -month)
+/// total instead of fragmenting across span-routed sub-day buckets. Each is
+/// equivalent to a one-rule always-on schedule (`{1, Day}` / `{1, Month}`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Bucket {
+    /// Real calendar days in local time.
+    Day,
     /// Real calendar months in local time.
     Month,
+}
+
+/// A time unit for a [`BucketInterval`]. The letters match the `range` grammar:
+/// `s`=second, `m`=minute, `h`=hour, `d`=day, `w`=week, `M`=month, `y`=year —
+/// case-sensitive, so lowercase `m` is minutes and uppercase `M` is months.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeUnit {
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+impl TimeUnit {
+    /// The compact grammar letter for this unit.
+    fn letter(self) -> char {
+        match self {
+            TimeUnit::Second => 's',
+            TimeUnit::Minute => 'm',
+            TimeUnit::Hour => 'h',
+            TimeUnit::Day => 'd',
+            TimeUnit::Week => 'w',
+            TimeUnit::Month => 'M',
+            TimeUnit::Year => 'y',
+        }
+    }
+
+    /// The singular Postgres `interval` unit name (pluralized with a trailing
+    /// `s` for a count above one).
+    fn pg_name(self) -> &'static str {
+        match self {
+            TimeUnit::Second => "second",
+            TimeUnit::Minute => "minute",
+            TimeUnit::Hour => "hour",
+            TimeUnit::Day => "day",
+            TimeUnit::Week => "week",
+            TimeUnit::Month => "month",
+            TimeUnit::Year => "year",
+        }
+    }
+
+    /// An approximate second count, for span-threshold comparison only (a month
+    /// is 30 days, a year 365 — fuzzy is fine; it only orders schedule rules).
+    pub fn approx_secs(self) -> u64 {
+        match self {
+            TimeUnit::Second => 1,
+            TimeUnit::Minute => 60,
+            TimeUnit::Hour => 3_600,
+            TimeUnit::Day => 86_400,
+            TimeUnit::Week => 604_800,
+            TimeUnit::Month => 2_592_000,
+            TimeUnit::Year => 31_536_000,
+        }
+    }
+
+    /// Whether this unit gets tz-aware calendar bucketing (`day`/`week`/`month`/
+    /// `year` land on local boundaries); the sub-day units are clock buckets
+    /// where the zone is irrelevant.
+    pub fn is_calendar(self) -> bool {
+        matches!(
+            self,
+            TimeUnit::Day | TimeUnit::Week | TimeUnit::Month | TimeUnit::Year
+        )
+    }
+}
+
+/// A time granularity: a count and a unit, parsed from a compact string like
+/// `10h`, `1m`, `1M`, `5y`. Serializes back to that compact form; [`to_pg_interval`]
+/// renders the Postgres `interval` literal for SQL.
+///
+/// [`to_pg_interval`]: BucketInterval::to_pg_interval
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BucketInterval {
+    pub count: u32,
+    pub unit: TimeUnit,
+}
+
+impl BucketInterval {
+    /// The Postgres `interval` literal, e.g. `1 day`, `1 month`, `5 minutes`. A
+    /// count of one is singular, above one appends an `s`.
+    pub fn to_pg_interval(&self) -> String {
+        let name = self.unit.pg_name();
+        if self.count == 1 {
+            format!("1 {name}")
+        } else {
+            format!("{} {name}s", self.count)
+        }
+    }
+
+    /// The approximate span in seconds (`count * unit.approx_secs()`), for
+    /// ordering and matching schedule rules.
+    pub fn span_secs(&self) -> u64 {
+        u64::from(self.count) * self.unit.approx_secs()
+    }
+}
+
+/// The compact `<count><letter>` form (the serialized/YAML form); the inverse of
+/// [`FromStr`]. Distinct from [`to_pg_interval`](BucketInterval::to_pg_interval).
+impl fmt::Display for BucketInterval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{}", self.count, self.unit.letter())
+    }
+}
+
+impl FromStr for BucketInterval {
+    type Err = anyhow::Error;
+
+    /// Parse `<digits><unit-letter>`: reject an empty count, a zero count, an
+    /// unknown or missing unit, and any trailing junk.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+        let (digits, unit_str) = s.split_at(split);
+        if digits.is_empty() {
+            bail!("bucket interval '{s}' has no leading count");
+        }
+        let count: u32 = digits
+            .parse()
+            .with_context(|| format!("bucket interval '{s}' has an out-of-range count"))?;
+        if count == 0 {
+            bail!("bucket interval '{s}' must have a positive count");
+        }
+        let unit = match unit_str {
+            "s" => TimeUnit::Second,
+            "m" => TimeUnit::Minute,
+            "h" => TimeUnit::Hour,
+            "d" => TimeUnit::Day,
+            "w" => TimeUnit::Week,
+            "M" => TimeUnit::Month,
+            "y" => TimeUnit::Year,
+            "" => bail!("bucket interval '{s}' has no unit letter (want s/m/h/d/w/M/y)"),
+            other => {
+                bail!("bucket interval '{s}' has an unknown unit '{other}' (want s/m/h/d/w/M/y)")
+            }
+        };
+        Ok(BucketInterval { count, unit })
+    }
+}
+
+/// Serialize as the compact `<count><letter>` string, so the JSON/YAML form
+/// round-trips through [`FromStr`].
+impl Serialize for BucketInterval {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for BucketInterval {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// One rule in a bucket schedule: for windows whose span is strictly less than
+/// `upto`, bucket at `every`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketRule {
+    pub upto: BucketInterval,
+    pub every: BucketInterval,
+}
+
+/// A view/panel bucketing policy: a fixed calendar unit (the scalar `day`/`month`
+/// shorthand) or a zoom-driven schedule. Untagged, so both `bucket: day` and
+/// `bucket: [ {upto, every}, … ]` parse.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BucketSpec {
+    /// A fixed calendar unit; equivalent to a one-rule always-on schedule.
+    Fixed(Bucket),
+    /// A schedule of rules, matched by window span (first `span < upto` wins,
+    /// else the last rule's `every` clamps the coarsest end).
+    Schedule(Vec<BucketRule>),
+}
+
+impl BucketSpec {
+    /// The bucket width to use for a window of `span_secs`. A fixed unit ignores
+    /// the span; a schedule returns the first rule whose `upto` the span is below,
+    /// or the coarsest (last) rule's `every` when the span outgrows them all.
+    pub fn resolve(&self, span_secs: u64) -> BucketInterval {
+        match self {
+            BucketSpec::Fixed(Bucket::Day) => BucketInterval {
+                count: 1,
+                unit: TimeUnit::Day,
+            },
+            BucketSpec::Fixed(Bucket::Month) => BucketInterval {
+                count: 1,
+                unit: TimeUnit::Month,
+            },
+            BucketSpec::Schedule(rules) => rules
+                .iter()
+                .find(|r| span_secs < r.upto.span_secs())
+                .or_else(|| rules.last())
+                .map_or(
+                    // Unreachable in practice: validate() rejects an empty
+                    // schedule before it can be resolved.
+                    BucketInterval {
+                        count: 1,
+                        unit: TimeUnit::Day,
+                    },
+                    |r| r.every,
+                ),
+        }
+    }
 }
 
 /// Which side of the panel an axis is drawn on.
@@ -261,12 +478,52 @@ impl Dashboards {
     /// can find the offending line.
     pub fn validate(&self) -> anyhow::Result<()> {
         for view in &self.views {
+            if let Some(spec) = &view.bucket {
+                validate_bucket(spec)
+                    .with_context(|| format!("view '{}' bucket", view.id))?;
+            }
             for panel in &view.panels {
+                if let Some(spec) = &panel.bucket {
+                    validate_bucket(spec).with_context(|| {
+                        format!("view '{}' / panel '{}' bucket", view.id, panel.title)
+                    })?;
+                }
                 validate_panel(view, panel)?;
             }
         }
         Ok(())
     }
+}
+
+/// Validate a bucket schedule: at least one rule, `upto` thresholds strictly
+/// increasing (by approximate span), and positive counts throughout. A fixed
+/// scalar bucket carries nothing to check.
+fn validate_bucket(spec: &BucketSpec) -> anyhow::Result<()> {
+    let BucketSpec::Schedule(rules) = spec else {
+        return Ok(());
+    };
+    if rules.is_empty() {
+        bail!("schedule is empty; give at least one {{upto, every}} rule");
+    }
+    let mut prev: Option<u64> = None;
+    for rule in rules {
+        // FromStr already rejects a zero count, but a programmatically built spec
+        // (or a future non-string deserializer) might not, so assert it here.
+        if rule.upto.count == 0 || rule.every.count == 0 {
+            bail!("schedule rule has a zero count");
+        }
+        let upto = rule.upto.span_secs();
+        if let Some(p) = prev
+            && upto <= p
+        {
+            bail!(
+                "schedule 'upto' thresholds must strictly increase; '{}' does not exceed the prior rule",
+                rule.upto
+            );
+        }
+        prev = Some(upto);
+    }
+    Ok(())
 }
 
 /// A `view / panel` prefix for error messages.
@@ -779,7 +1036,195 @@ views:
         assert_eq!(net.expr.as_deref(), Some("prod + cons"));
 
         // Calendar-month bucketing on the yearly view.
-        assert_eq!(dbs.views[1].bucket, Some(Bucket::Month));
+        assert_eq!(dbs.views[1].bucket, Some(BucketSpec::Fixed(Bucket::Month)));
+    }
+
+    #[test]
+    fn parses_a_calendar_day_bucket() {
+        // The second calendar exception: a view (or panel) can pin whole days,
+        // so a daily-reset counter charted with max reads as one bar per day.
+        let yaml = r#"
+views:
+  - id: daily
+    title: Daily
+    bucket: day
+    panels:
+      - title: P
+        series:
+          - {label: Draw, uuid: "deadbeef-0000-0000-0000-000000000001", agg: max, type: bar}
+"#;
+        let dbs = DashboardStore::parse_and_validate(yaml).unwrap();
+        assert_eq!(dbs.views[0].bucket, Some(BucketSpec::Fixed(Bucket::Day)));
+    }
+
+    #[test]
+    fn bucket_interval_parses_and_renders() {
+        let bi = |s: &str| s.parse::<BucketInterval>().unwrap();
+        assert_eq!(
+            bi("10h"),
+            BucketInterval {
+                count: 10,
+                unit: TimeUnit::Hour
+            }
+        );
+        assert_eq!(
+            bi("1m"),
+            BucketInterval {
+                count: 1,
+                unit: TimeUnit::Minute
+            }
+        );
+        assert_eq!(
+            bi("1M"),
+            BucketInterval {
+                count: 1,
+                unit: TimeUnit::Month
+            }
+        );
+        assert_eq!(
+            bi("5y"),
+            BucketInterval {
+                count: 5,
+                unit: TimeUnit::Year
+            }
+        );
+        assert_eq!(
+            bi("30m"),
+            BucketInterval {
+                count: 30,
+                unit: TimeUnit::Minute
+            }
+        );
+
+        // to_pg_interval: singular at 1, pluralized above.
+        assert_eq!(bi("1d").to_pg_interval(), "1 day");
+        assert_eq!(bi("1M").to_pg_interval(), "1 month");
+        assert_eq!(bi("5m").to_pg_interval(), "5 minutes");
+        assert_eq!(bi("30m").to_pg_interval(), "30 minutes");
+        assert_eq!(bi("1h").to_pg_interval(), "1 hour");
+
+        // Display is the compact inverse of FromStr (m vs M preserved).
+        assert_eq!(bi("30m").to_string(), "30m");
+        assert_eq!(bi("1M").to_string(), "1M");
+
+        // Rejects: empty, no count, zero, unknown unit, a float.
+        assert!("".parse::<BucketInterval>().is_err());
+        assert!("h".parse::<BucketInterval>().is_err());
+        assert!("0d".parse::<BucketInterval>().is_err());
+        assert!("10x".parse::<BucketInterval>().is_err());
+        assert!("1.5h".parse::<BucketInterval>().is_err());
+    }
+
+    /// The 4-rule target schedule, reused by the parse and resolve tests.
+    const SCHED: &str = r#"
+views:
+  - id: zoom
+    title: Zoom
+    bucket:
+      - {upto: 10h, every: 1m}
+      - {upto: 10d, every: 1h}
+      - {upto: 10M, every: 1d}
+      - {upto: 5y,  every: 1M}
+    panels:
+      - title: P
+        series:
+          - {label: Draw, uuid: "deadbeef-0000-0000-0000-000000000001", agg: avg}
+"#;
+
+    #[test]
+    fn parses_a_bucket_schedule() {
+        let dbs = DashboardStore::parse_and_validate(SCHED).unwrap();
+        let Some(BucketSpec::Schedule(rules)) = &dbs.views[0].bucket else {
+            panic!("expected a schedule, got {:?}", dbs.views[0].bucket);
+        };
+        assert_eq!(rules.len(), 4);
+        assert_eq!(rules[0].upto.unit, TimeUnit::Hour);
+        assert_eq!(rules[0].every.unit, TimeUnit::Minute);
+        assert_eq!(rules[2].upto.unit, TimeUnit::Month);
+        assert_eq!(rules[2].every.unit, TimeUnit::Day);
+        assert_eq!(rules[3].every.unit, TimeUnit::Month);
+    }
+
+    #[test]
+    fn resolves_a_schedule_by_span() {
+        let dbs = DashboardStore::parse_and_validate(SCHED).unwrap();
+        let spec = dbs.views[0].bucket.as_ref().unwrap();
+        let d = 86_400;
+        let minute = BucketInterval {
+            count: 1,
+            unit: TimeUnit::Minute,
+        };
+        let hour = BucketInterval {
+            count: 1,
+            unit: TimeUnit::Hour,
+        };
+        let day = BucketInterval {
+            count: 1,
+            unit: TimeUnit::Day,
+        };
+        let month = BucketInterval {
+            count: 1,
+            unit: TimeUnit::Month,
+        };
+        assert_eq!(spec.resolve(5 * 3_600), minute); // 5h  -> 1m
+        assert_eq!(spec.resolve(5 * d), hour); // 5d  -> 1h
+        assert_eq!(spec.resolve(150 * d), day); // ~5M -> 1d
+        assert_eq!(spec.resolve(3 * 365 * d), month); // 3y  -> 1M
+        assert_eq!(spec.resolve(10 * 365 * d), month); // 10y -> clamp to 1M
+    }
+
+    #[test]
+    fn resolves_the_scalar_shorthand() {
+        assert_eq!(
+            BucketSpec::Fixed(Bucket::Day).resolve(999),
+            BucketInterval {
+                count: 1,
+                unit: TimeUnit::Day
+            }
+        );
+        assert_eq!(
+            BucketSpec::Fixed(Bucket::Month).resolve(999),
+            BucketInterval {
+                count: 1,
+                unit: TimeUnit::Month
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_a_non_increasing_schedule() {
+        let yaml = r#"
+views:
+  - id: v
+    title: V
+    bucket:
+      - {upto: 10d, every: 1h}
+      - {upto: 10h, every: 1m}
+    panels:
+      - title: P
+        series:
+          - {label: A, uuid: "deadbeef-0000-0000-0000-000000000001"}
+"#;
+        let err = DashboardStore::parse_and_validate(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("strictly increase"), "message was: {msg}");
+    }
+
+    #[test]
+    fn rejects_an_empty_schedule() {
+        let yaml = r#"
+views:
+  - id: v
+    title: V
+    bucket: []
+    panels:
+      - title: P
+        series:
+          - {label: A, uuid: "deadbeef-0000-0000-0000-000000000001"}
+"#;
+        let err = DashboardStore::parse_and_validate(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("empty"), "message was: {msg}");
     }
 
     #[test]
@@ -1013,6 +1458,6 @@ views:
         assert_eq!(climate.series[0].gapfill, None);
 
         // The second view buckets real calendar months.
-        assert_eq!(dbs.views[1].bucket, Some(Bucket::Month));
+        assert_eq!(dbs.views[1].bucket, Some(BucketSpec::Fixed(Bucket::Month)));
     }
 }
