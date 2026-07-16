@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=./dashboard.schema.yaml
 # loxweb sample dashboards. Copy this file, point config.yaml at it, and edit.
 #
 # Everything here is SYNTHETIC: invented rooms and made-up uuids

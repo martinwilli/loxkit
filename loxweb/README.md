@@ -107,6 +107,22 @@ lowercase `m` minutes and uppercase `M` months. The `every` unit decides the res
 a **calendar** unit (`d`/`w`/`M`/`y`) buckets on local boundaries, a **clock** unit
 (`s`/`m`/`h`) in plain wall time. `upto` thresholds must strictly increase.
 
+### Schema
+
+A machine-readable JSON Schema (draft 2020-12) for this file ships alongside it
+at `dashboard.schema.yaml`. It pins the accepted keys — matching the loader,
+which rejects unknown ones — and carries the field docs, so an editor can offer
+completion and flag typos as you edit. Point your editor's YAML language server
+at it with a first-line comment in the config:
+
+```yaml
+# yaml-language-server: $schema=./dashboard.schema.yaml
+```
+
+A few invariants live in the schema's descriptions rather than its rules — axis
+references resolving within a panel, `expr` naming real siblings without cycles,
+schedule thresholds increasing — and are enforced when the file is loaded.
+
 ## Seeding synthetic data for the example
 
 `dashboards.example.yaml` references made-up uuids, so the panels render empty
