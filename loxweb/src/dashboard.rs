@@ -105,7 +105,7 @@ pub struct Axis {
     /// band of readings far from it (room temperatures, say) is squashed into a
     /// sliver at the top. An explicit `min`/`max` still pins that bound.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub scale: bool,
+    pub fit: bool,
 }
 
 /// A single series: either bound to a store uuid or derived from siblings.
@@ -1378,8 +1378,8 @@ views:
     }
 
     #[test]
-    fn parses_an_axis_scale_flag() {
-        // scale:true opts an axis out of the zero baseline; absent it defaults
+    fn parses_an_axis_fit_flag() {
+        // fit:true opts an axis out of the zero baseline; absent it defaults
         // to false (the ECharts zero-anchored behavior).
         let yaml = r#"
 views:
@@ -1388,14 +1388,14 @@ views:
     panels:
       - title: P
         axes:
-          - {id: temp, side: left, unit: "°C", scale: true}
+          - {id: temp, side: left, unit: "°C", fit: true}
           - {id: pct, side: right, unit: "%"}
         series:
           - {uuid: "deadbeef-0000-0000-0000-000000000001", axis: temp}
 "#;
         let dbs = DashboardStore::parse_and_validate(yaml).unwrap();
-        assert!(dbs.views[0].panels[0].axes[0].scale);
-        assert!(!dbs.views[0].panels[0].axes[1].scale);
+        assert!(dbs.views[0].panels[0].axes[0].fit);
+        assert!(!dbs.views[0].panels[0].axes[1].fit);
     }
 
     #[test]
