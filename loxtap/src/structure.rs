@@ -87,6 +87,23 @@ pub struct StateEntry {
     pub agg_mode: AggMode,
 }
 
+impl StateEntry {
+    /// Whether this series is a redundant per-room copy of the site's single
+    /// outdoor temperature, and so not worth storing.
+    ///
+    /// An `IRoomControllerV2` rebroadcasts one outdoor-temperature source to
+    /// every room it manages, so each room carries an identical
+    /// `actualOutdoorTemp` and a near-identical `averageOutdoorTemp`. With N
+    /// rooms that is N copies of one signal. The distinct outdoor readings a
+    /// site keeps live on other controls (a dedicated outdoor sensor, or the
+    /// climate controller's own damped average), none of which match this, so
+    /// the room mirrors carry nothing unique.
+    pub fn is_redundant_outdoor_mirror(&self) -> bool {
+        self.control == "IRoomControllerV2"
+            && matches!(self.sub.as_str(), "actualOutdoorTemp" | "averageOutdoorTemp")
+    }
+}
+
 /// A parsed structure file: the flat uuid map plus its freshness stamp.
 #[derive(Clone, Debug, Default)]
 pub struct Structure {
@@ -119,6 +136,16 @@ impl Structure {
     /// Resolve a state uuid to its labels in O(1); the event-time hot path.
     pub fn resolve(&self, uuid: &LoxUuid) -> Option<&StateEntry> {
         self.index.get(uuid)
+    }
+
+    /// Whether a value for `uuid` should be dropped at ingest rather than
+    /// stored. True only for a resolved [redundant outdoor
+    /// mirror](StateEntry::is_redundant_outdoor_mirror); an unknown uuid is
+    /// never dropped, so an unresolved series still lands.
+    pub fn is_ingest_filtered(&self, uuid: &LoxUuid) -> bool {
+        self.index
+            .get(uuid)
+            .is_some_and(StateEntry::is_redundant_outdoor_mirror)
     }
 
     /// Build the [`SeriesMeta`] a sink upserts for a resolved uuid.
@@ -816,5 +843,49 @@ mod tests {
         let structure = Structure::parse(json).unwrap();
         assert_eq!(structure.len(), 1);
         assert!(structure.resolve(&uuid("deadbeef-2222-0000-0000000000000099")).is_some());
+    }
+
+    #[test]
+    fn redundant_outdoor_mirror_matches_only_room_controller_outdoor_temps() {
+        let entry = |control: &str, sub: &str| StateEntry {
+            control: control.to_owned(),
+            name: "x".to_owned(),
+            room: None,
+            category: None,
+            sub: sub.to_owned(),
+            unit: None,
+            agg_mode: AggMode::Gauge,
+        };
+        // The two per-room outdoor-temp states on a room controller are dropped.
+        assert!(entry("IRoomControllerV2", "actualOutdoorTemp").is_redundant_outdoor_mirror());
+        assert!(entry("IRoomControllerV2", "averageOutdoorTemp").is_redundant_outdoor_mirror());
+        // A room controller's other states stay.
+        assert!(!entry("IRoomControllerV2", "tempActual").is_redundant_outdoor_mirror());
+        // The same state name on any other control stays: the climate
+        // controller's own damped average, and a dedicated outdoor sensor.
+        assert!(!entry("ClimateControllerUS", "actualOutdoorTemp").is_redundant_outdoor_mirror());
+        assert!(!entry("InfoOnlyAnalog", "value").is_redundant_outdoor_mirror());
+    }
+
+    #[test]
+    fn ingest_filter_drops_room_outdoor_temps_but_keeps_unknowns() {
+        let json = r#"{
+          "controls": {
+            "deadbeef-1111-0000-0000000000000001": {
+              "name": "Room A Climate",
+              "type": "IRoomControllerV2",
+              "states": {
+                "actualOutdoorTemp": "deadbeef-2222-0000-0000000000000001",
+                "tempActual": "deadbeef-2222-0000-0000000000000002"
+              }
+            }
+          }
+        }"#;
+        let structure = Structure::parse(json).unwrap();
+        // The outdoor-temp mirror is filtered; the room's own temp is not.
+        assert!(structure.is_ingest_filtered(&uuid("deadbeef-2222-0000-0000000000000001")));
+        assert!(!structure.is_ingest_filtered(&uuid("deadbeef-2222-0000-0000000000000002")));
+        // An unknown uuid is never filtered, so an unresolved series still lands.
+        assert!(!structure.is_ingest_filtered(&uuid("00000000-0000-0000-0000000000000099")));
     }
 }

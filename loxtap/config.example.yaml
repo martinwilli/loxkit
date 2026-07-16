@@ -2,36 +2,32 @@
 # All placeholders below are examples, not working credentials.
 
 # Miniserver connection.
-host: miniserver.example
-port: 80
+miniserver:
+  host: miniserver.example
+  port: 80
 
-# Login credentials for the Miniserver user the daemon authenticates as.
-user: user
-password: password
+  # Login credentials for the Miniserver user the daemon authenticates as.
+  user: user
+  password: password
 
-# SHA-256 pin of the Miniserver's public key, as printed on first connect.
-# Enforced by the crypto handshake: the daemon refuses to start on a mismatch.
-server_key_pin: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  # SHA-256 pin of the Miniserver's public key, as printed on first connect.
+  # Enforced by the crypto handshake: the daemon refuses to start on a mismatch.
+  server_key_pin: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
-# Stable client id under which the Miniserver tracks tokens issued to us.
-# Generate once (any uuid), then keep it fixed.
-token_uuid: 00000000-0000-0000-0000000000000000
-info: loxtap
+  # Reconnect and keepalive timing (seconds). Defaults shown; all optional.
+  reconnect:
+    backoff_base_secs: 2
+    backoff_max_secs: 300
+    keepalive_secs: 240
 
-# Where resolved readings go. "debug" logs each reading; "timescale" writes to
-# the TimescaleDB store configured below.
-sink: debug
+# The client id the server tracks tokens under, and its device-list label, are
+# derived from the host (machine-id and hostname), so nothing goes here.
 
 # Fallback log level when RUST_LOG is unset (error, warn, info, debug, trace).
 log_level: info
 
-# Reconnect and keepalive timing (seconds). Defaults shown; all optional.
-reconnect:
-  backoff_base_secs: 2
-  backoff_max_secs: 300
-  keepalive_secs: 240
-
-# TimescaleDB sink connection, used when sink: timescale above. Plain Postgres
+# TimescaleDB sink connection. Defining this section selects the TimescaleDB
+# sink; drop or comment it out to fall back to the debug sink. Plain Postgres
 # over a trusted LAN (no TLS). All values below are placeholders.
 timescale:
   host: timescale.example
@@ -39,3 +35,8 @@ timescale:
   user: loxtap
   password: password
   dbname: loxtap
+  # Optional IANA timezone to pin as the store's default, e.g. "Europe/Zurich",
+  # so the daily/monthly dashboard rollups bucket in local time instead of UTC.
+  # Applied with ALTER DATABASE on startup (the daemon must own the database);
+  # unset leaves the server default. Stored timestamps are UTC either way.
+  # timezone: "Region/City"

@@ -185,7 +185,13 @@ pub(crate) async fn handle_table(
             if !payload.len().is_multiple_of(VALUE_ENTRY_SIZE) {
                 warn!(len = payload.len(), "value table is not a whole number of entries");
             }
-            let readings = decode_value_table(payload, SystemTime::now());
+            let mut readings = decode_value_table(payload, SystemTime::now());
+            // Never store the redundant per-room outdoor-temperature mirrors: a
+            // room controller rebroadcasts one outdoor source to every room, so
+            // the per-room copies are duplicates of a single signal. Drop them
+            // here, ahead of both the label upsert and the write, so they never
+            // become a series in the store.
+            readings.retain(|r| !structure.is_ingest_filtered(&r.uuid));
             if readings.is_empty() {
                 return;
             }
@@ -253,6 +259,17 @@ mod tests {
           "name": "Status Text",
           "type": "InfoOnlyText",
           "states": { "text": "deadbeef-5555-0000-0000000000000001" }
+        },
+        "deadbeef-1111-0000-0000000000000003": {
+          "name": "Room A Climate",
+          "type": "IRoomControllerV2",
+          "room": "deadbeef-0000-0000-0000000000000001",
+          "cat": "deadbeef-0000-0000-0000000000000002",
+          "states": {
+            "tempActual": "deadbeef-3333-0000-0000000000000001",
+            "actualOutdoorTemp": "deadbeef-3333-0000-0000000000000002",
+            "averageOutdoorTemp": "deadbeef-3333-0000-0000000000000003"
+          }
         }
       }
     }"#;
@@ -387,6 +404,38 @@ mod tests {
         assert_eq!(metas[0].name, "Temperature");
         assert_eq!(metas[0].room.as_deref(), Some("Room A"));
         assert_eq!(metas[0].unit.as_deref(), Some("°C"));
+    }
+
+    #[tokio::test]
+    async fn redundant_room_outdoor_temps_are_dropped_before_the_sink() {
+        let structure = Structure::parse(FIXTURE).unwrap();
+        let sink = RecordingSink::default();
+        // A room controller's two outdoor-temp mirrors (dropped), plus its own
+        // room temp, the InfoOnlyAnalog Temperature, and an unknown uuid (kept).
+        let blob = value_blob(&[
+            ("deadbeef-3333-0000-0000000000000002", 23.4), // actualOutdoorTemp, dropped
+            ("deadbeef-3333-0000-0000000000000003", 23.9), // averageOutdoorTemp, dropped
+            ("deadbeef-3333-0000-0000000000000001", 21.0), // tempActual, kept
+            ("deadbeef-2222-0000-0000000000000001", 21.5), // Temperature, kept
+            ("00000000-0000-0000-0000000000000099", 7.0),  // unknown, kept
+        ]);
+        handle_table(MessageType::ValueStates, &blob, &structure, &sink).await;
+
+        // The two outdoor-temp mirrors never reach the sink; the other three do.
+        let readings = sink.readings.lock().unwrap();
+        assert_eq!(readings.len(), 3);
+        let kept: Vec<_> = readings.iter().map(|r| r.uuid).collect();
+        assert!(!kept.contains(&uuid("deadbeef-3333-0000-0000000000000002")));
+        assert!(!kept.contains(&uuid("deadbeef-3333-0000-0000000000000003")));
+        assert!(kept.contains(&uuid("deadbeef-3333-0000-0000000000000001")));
+
+        // Their labels are dropped too: only the resolved kept series upsert
+        // (tempActual + Temperature; the unknown uuid resolves to nothing).
+        let metas = sink.metas.lock().unwrap();
+        assert_eq!(metas.len(), 2);
+        assert!(metas
+            .iter()
+            .all(|m| m.sub != "actualOutdoorTemp" && m.sub != "averageOutdoorTemp"));
     }
 
     #[tokio::test]
