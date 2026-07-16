@@ -292,7 +292,7 @@
   // A relative range is `now` or `now-<n><unit>` with units s m h d w M y
   // (m = minutes, M = months). It resolves against a supplied clock so it is
   // deterministic under test. Months/years use calendar arithmetic; the rest
-  // are fixed multiples. Refresh is `<n><unit>` (s|m|h) or `off`.
+  // are fixed multiples.
   // =========================================================================
 
   var FIXED_UNIT_MS = {
@@ -330,21 +330,6 @@
     return { from: from, to: to };
   }
 
-  function parseRefreshMs(spec) {
-    if (spec === undefined || spec === null) {
-      return null;
-    }
-    var s = String(spec).trim();
-    if (s === "" || s === "off") {
-      return null;
-    }
-    var m = /^(\d+)([smh])$/.exec(s);
-    if (!m) {
-      return null;
-    }
-    return parseInt(m[1], 10) * FIXED_UNIT_MS[m[2]];
-  }
-
   // --- exports for headless unit tests; browser engine does not run in node ---
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
@@ -358,7 +343,6 @@
       evalDerivedGrid: evalDerivedGrid,
       buildPanelSeriesData: buildPanelSeriesData,
       parseRange: parseRange,
-      parseRefreshMs: parseRefreshMs,
     };
     return;
   }
@@ -398,6 +382,12 @@
     range: { kind: "rel", spec: DEFAULT_RANGE },
   };
 
+  // Per-view data floor (earliest sample, epoch ms) fetched from api/extent and
+  // cached by view id. A number clamps the padded window's left edge; null means
+  // the view has no data; undefined means not fetched yet (treated as no clamp).
+  // The floor only moves on first-ever ingest, so a session-lifetime cache is fine.
+  var viewFloors = {};
+
   function currentView() {
     for (var i = 0; i < state.views.length; i += 1) {
       if (state.views[i].id === state.viewId) {
@@ -407,65 +397,49 @@
     return state.views[0] || null;
   }
 
+  // The current view's floor as a number, or null when unknown/absent.
+  function currentFloor() {
+    var f = viewFloors[state.viewId];
+    return typeof f === "number" ? f : null;
+  }
+
   // Resolve the effective [from,to] ms window from the range state and clock.
   function resolveWindow() {
     if (state.range.kind === "abs") {
-      return { from: state.range.from, to: state.range.to };
+      // A bookmarked or hand-edited URL could carry a `to` past now; clamp it so
+      // an absolute window can't open into the future either.
+      return { from: state.range.from, to: Math.min(state.range.to, Date.now()) };
     }
     var w = parseRange(state.range.spec, Date.now());
     return w || parseRange(DEFAULT_RANGE, Date.now());
   }
 
   // The wheel/slider zoom lives inside the loaded data, so a panel fetches and
-  // pins its x-axis to a window PADDED by this fraction of the span on each
-  // side, while the dataZoom shows only the inner [from,to]. That inset gives
-  // scroll-out room to reveal loaded margin instead of dead-ending at the data
-  // edge; and a settled zoom that stays within the margin AND keeps the same
-  // bucket rung skips the requery entirely (see zoomRestingInLoaded), so a burst
-  // of wheel notches no longer refetches identical data every notch. Since the
-  // inner window is set by absolute value, the visible range holds steady across
-  // a redraw (see buildPanelOption and onZoom).
+  // pins its x-axis to a window PADDED by this fraction of the span on each side,
+  // while the dataZoom shows only the inner [from,to]. That inset gives scroll-out
+  // room to reveal loaded margin instead of dead-ending at the data edge while a
+  // drag is still in flight; a settled zoom requeries regardless (see onZoom). The
+  // bucket width, though, follows the inner visible window rather than this padded
+  // fetch, so what the user actually sees hits the server's target point count --
+  // fetchSeries passes the visible window as vfrom/vto alongside the padded
+  // from/to. Since the inner window is set by absolute value, the visible range
+  // holds steady across a redraw (see buildPanelOption and onZoom).
   var ZOOM_PAD = 0.5;
 
   function padWindow(win) {
     var pad = (win.to - win.from) * ZOOM_PAD;
-    return { from: Math.round(win.from - pad), to: Math.round(win.to + pad) };
-  }
-
-  // A client-side mirror of the server tier router (query.rs route/snap): map a
-  // window span to the bucket-width rung it resolves to, as a stable key. The
-  // server stays authoritative for the query; the client uses this ONLY to tell
-  // whether a settled zoom would change the resolution, so an in-pad zoom that
-  // keeps the same rung can skip the requery (see zoomRestingInLoaded). Keep the
-  // ladders and TARGET_BUCKETS in sync with query.rs. Rungs don't overlap across
-  // tiers, so the width in seconds is itself a unique key.
-  var TARGET_BUCKETS = 1000;
-  var HOUR_SECS = 3600;
-  var DAY_SECS = 86400;
-  var SUBHOUR_LADDER = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800];
-  var HOUR_LADDER = [3600, 7200, 10800, 14400, 21600, 28800, 43200];
-  var DAY_LADDER = [86400, 172800, 259200, 432000, 604800, 1209600, 2592000];
-
-  function snapLadder(ladder, ideal) {
-    for (var i = 0; i < ladder.length; i += 1) {
-      if (ladder[i] >= ideal) {
-        return ladder[i];
-      }
-    }
-    return ladder[ladder.length - 1];
-  }
-
-  // Span in ms -> resolved bucket width in seconds. Mirrors the server's integer
-  // math: span_secs = floor(ms/1000), ideal = floor(span_secs / TARGET_BUCKETS).
-  function bucketWidth(spanMs) {
-    var ideal = Math.floor(Math.floor(spanMs / 1000) / TARGET_BUCKETS);
-    if (ideal < HOUR_SECS) {
-      return snapLadder(SUBHOUR_LADDER, ideal);
-    }
-    if (ideal < DAY_SECS) {
-      return snapLadder(HOUR_LADDER, ideal);
-    }
-    return snapLadder(DAY_LADDER, ideal);
+    // Don't pad past the data on either side. On the right, a margin beyond now
+    // would expose empty future space or stray future-dated points, so clamp to
+    // now. On the left, symmetrically, don't open before the view's earliest
+    // sample (currentFloor): the pre-data region gapfills to blanks and there is
+    // nothing to reveal there. An unknown floor (not yet fetched) leaves the left
+    // margin untouched, i.e. the pre-clamp behavior.
+    var floor = currentFloor();
+    var left = Math.round(win.from - pad);
+    return {
+      from: floor !== null ? Math.max(left, floor) : left,
+      to: Math.min(Math.round(win.to + pad), Date.now()),
+    };
   }
 
   function readUrl() {
@@ -510,8 +484,8 @@
 
   // =========================================================================
   // Section 6 -- data fetch, with in-flight cancellation. A drag-zoom or a
-  // refresh supersedes any pending fetch: we abort the previous batch before
-  // starting a new one, so a narrow zoom never races a stale wide response.
+  // view/range switch supersedes any pending fetch: we abort the previous batch
+  // before starting a new one, so a narrow zoom never races a stale wide response.
   // =========================================================================
 
   var inflight = null;
@@ -532,7 +506,34 @@
     });
   }
 
-  function fetchSeries(viewId, panelIdx, seriesIdx, win, signal) {
+  // Fetch and cache a view's data floor (earliest sample) into viewFloors. Best
+  // effort and fire-and-forget: rendering never waits on it, since the floor only
+  // bites once a zoom-out reaches deep history (the default window's left pad sits
+  // well after any real floor). A view already cached (even as null) is left be; a
+  // failed fetch leaves the entry unset so a later visit retries.
+  function loadFloor(viewId) {
+    if (!viewId || Object.prototype.hasOwnProperty.call(viewFloors, viewId)) {
+      return;
+    }
+    fetch("api/extent?view=" + encodeURIComponent(viewId))
+      .then(function (resp) {
+        if (!resp.ok) {
+          throw new Error("api/extent HTTP " + resp.status);
+        }
+        return resp.json();
+      })
+      .then(function (data) {
+        viewFloors[viewId] = typeof data.floor_ms === "number" ? data.floor_ms : null;
+      })
+      .catch(function () {
+        // Leave it unset; the left clamp is a best-effort nicety, not required.
+      });
+  }
+
+  // `win` is the (padded) window to scan; `viewWin` is the visible window the user
+  // sees, sent as vfrom/vto so the server picks the bucket width for what's on
+  // screen rather than for the wider fetch.
+  function fetchSeries(viewId, panelIdx, seriesIdx, win, viewWin, signal) {
     var url =
       "api/series?view=" +
       encodeURIComponent(viewId) +
@@ -543,7 +544,11 @@
       "&from=" +
       win.from +
       "&to=" +
-      win.to;
+      win.to +
+      "&vfrom=" +
+      viewWin.from +
+      "&vto=" +
+      viewWin.to;
     return fetch(url, { signal: signal }).then(function (resp) {
       if (!resp.ok) {
         throw new Error("api/series HTTP " + resp.status);
@@ -684,9 +689,8 @@
     });
 
     return {
-      // Never animate: an initial line-draw is just slow, and on data updates
-      // (zoom requery, refresh) a transition slides the graph around before it
-      // settles on the new window.
+      // Never animate: an initial line-draw is just slow, and on a zoom requery
+      // a transition slides the graph around before it settles on the new window.
       animation: false,
       backgroundColor: "transparent",
       textStyle: { color: chrome.ink2, fontFamily: "system-ui, -apple-system, sans-serif" },
@@ -807,7 +811,7 @@
 
   // Fetch a panel's bound series, evaluate its derived series, and paint.
   // A failed bound fetch shows a per-panel error rather than crashing the view;
-  // an aborted fetch (a superseding zoom/refresh) is ignored.
+  // an aborted fetch (a superseding zoom) is ignored.
   function loadPanel(view, panel, panelIdx, chart, plot, win) {
     plot.classList.add("loading");
     var signal = inflight ? inflight.signal : undefined;
@@ -816,7 +820,7 @@
 
     var fetches = panel.series.map(function (s, seriesIdx) {
       if (s.uuid !== undefined && s.uuid !== null) {
-        return fetchSeries(view.id, panelIdx, seriesIdx, padWin, signal);
+        return fetchSeries(view.id, panelIdx, seriesIdx, padWin, win, signal);
       }
       return Promise.resolve(null); // derived: computed client-side
     });
@@ -835,11 +839,8 @@
         var seriesData = buildPanelSeriesData(panel.series, boundPoints);
         // Remember the extent we pinned the axis to, so onZoom can resolve a
         // zoom's percentages against the window actually on screen (a burst of
-        // ticks all map against this, not against the drifting state.range), and
-        // the rung this data was fetched at, so a later zoom can tell whether a
-        // requery would change the resolution (see zoomRestingInLoaded).
+        // ticks all map against this, not against the drifting state.range).
         chart.__padWin = padWin;
-        chart.__loadedKey = bucketWidth(padWin.to - padWin.from);
         suppressZoom = true;
         chart.setOption(buildPanelOption(panel, seriesData, win, padWin, dbUnits), {
           notMerge: true,
@@ -874,15 +875,15 @@
   }
 
   // =========================================================================
-  // Section 9 -- interaction: drag-zoom -> tier-routed requery, and refresh.
+  // Section 9 -- interaction: drag-zoom -> tier-routed requery.
   //
   // The zoom read is the interaction risk. On a datazoom event we map the
   // reported percentages against the chart's rendered axis extent to an absolute
   // [from,to] (value bounds are the fallback), switch the global
   // range to that window, DEBOUNCE the burst (connected panels each fire an
   // event), cancel any in-flight fetches, and refetch every panel once. The
-  // server tier-routes by span, so a narrower window transparently pulls a finer
-  // aggregate tier.
+  // server tier-routes by the visible span we hand it, so a narrower window
+  // transparently pulls a finer aggregate tier.
   // =========================================================================
 
   var zoomTimer = null;
@@ -921,35 +922,12 @@
     }
     zoomTimer = setTimeout(function () {
       zoomTimer = null;
-      if (zoomRestingInLoaded()) {
-        return; // resolution unchanged and the view sits in loaded margin;
-        // ECharts already drew the client-side zoom, so a requery is a no-op.
-      }
+      // Always requery once the burst settles. ECharts has already drawn the
+      // client-side zoom against the loaded (padded) data, but only the server can
+      // rebucket to the resolution the new visible window wants, so crossing a
+      // bucket boundary and staying inside one both come back consistently drawn.
       reloadAllPanels();
     }, 280);
-  }
-
-  // Whether a settled zoom needs no requery: every chart's new window still
-  // sits inside the padded extent its data was loaded at, AND that data was
-  // fetched at the same bucket rung this window would resolve to. Then the
-  // loaded series already cover the view at the right density and ECharts has
-  // rendered the client-side zoom. Conservative -- a chart that hasn't loaded
-  // (no __padWin) forces a reload rather than risk showing stale resolution.
-  function zoomRestingInLoaded() {
-    if (!charts.length) {
-      return false;
-    }
-    var win = resolveWindow();
-    var pad = padWindow(win);
-    var key = bucketWidth(pad.to - pad.from);
-    return charts.every(function (c) {
-      return (
-        c.__padWin &&
-        c.__loadedKey === key &&
-        win.from >= c.__padWin.from &&
-        win.to <= c.__padWin.to
-      );
-    });
   }
 
   // Refetch every panel of the current view against the current window, with a
@@ -968,40 +946,6 @@
         loadPanel(view, panel, panelIdx, chart, chart.getDom(), win);
       }
     });
-  }
-
-  var refreshTimer = null;
-
-  function scheduleRefresh() {
-    if (refreshTimer) {
-      clearInterval(refreshTimer);
-      refreshTimer = null;
-    }
-    if (document.hidden) {
-      return; // paused while the tab is hidden
-    }
-    var view = currentView();
-    var ms = view ? parseRefreshMs(view.refresh) : null;
-    if (!ms) {
-      return;
-    }
-    refreshTimer = setInterval(function () {
-      // A relative range slides `now` forward; an absolute one refetches its
-      // fixed window (still useful -- the latest tier data may have changed).
-      reloadAllPanels();
-    }, ms);
-  }
-
-  function onVisibility() {
-    if (document.hidden) {
-      if (refreshTimer) {
-        clearInterval(refreshTimer);
-        refreshTimer = null;
-      }
-    } else {
-      reloadAllPanels();
-      scheduleRefresh();
-    }
   }
 
   // =========================================================================
@@ -1030,6 +974,7 @@
           return;
         }
         state.viewId = v.id;
+        loadFloor(v.id); // cache the new view's data floor for the left clamp
         applyViewDefaultRange(); // switching a view adopts its default window
         writeUrl();
         renderTabs();
@@ -1070,7 +1015,6 @@
     abortInflight();
     inflight = new AbortController();
     renderView();
-    scheduleRefresh();
   }
 
   // =========================================================================
@@ -1085,6 +1029,7 @@
         if (!state.viewId || !currentView()) {
           state.viewId = state.views.length ? state.views[0].id : null;
         }
+        loadFloor(state.viewId); // cache the initial view's floor (non-blocking)
         if (!state.range) {
           applyViewDefaultRange();
         }
@@ -1093,7 +1038,6 @@
         renderRanges();
         fullRender();
 
-        document.addEventListener("visibilitychange", onVisibility);
         if (global.matchMedia) {
           var mq = global.matchMedia("(prefers-color-scheme: dark)");
           var onThemeChange = function () {

@@ -90,7 +90,8 @@ pub fn router(store: Arc<DashboardStore>, pool: Pool, base_path: &str) -> Router
         .route(&prefixed("/style.css"), get(style_css))
         .route(&prefixed("/echarts.min.js"), get(echarts_js))
         .route(&prefixed("/api/views"), get(get_views))
-        .route(&prefixed("/api/series"), get(get_series));
+        .route(&prefixed("/api/series"), get(get_series))
+        .route(&prefixed("/api/extent"), get(get_extent));
 
     router = if base.is_empty() {
         router.route("/", get(index))
@@ -143,10 +144,17 @@ struct SeriesQuery {
     panel: usize,
     /// Series index within the panel.
     series: usize,
-    /// Window start, Unix epoch milliseconds (JS-native).
+    /// Scanned-window start, Unix epoch milliseconds (JS-native).
     from: i64,
-    /// Window end, Unix epoch milliseconds.
+    /// Scanned-window end, Unix epoch milliseconds.
     to: i64,
+    /// Visible-window start, Unix epoch milliseconds. Absent for a non-zoom
+    /// caller; then the bucket width follows the scanned `[from, to]` span.
+    #[serde(default)]
+    vfrom: Option<i64>,
+    /// Visible-window end, Unix epoch milliseconds.
+    #[serde(default)]
+    vto: Option<i64>,
 }
 
 /// The `GET /api/series` response: the store's unit label for the series (from
@@ -171,7 +179,7 @@ async fn get_series(
     // reload never blocks on this request.
     let req = {
         let dash = state.store.current();
-        resolve_request(&dash, &q.view, q.panel, q.series, q.from, q.to)?
+        resolve_request(&dash, &q.view, q.panel, q.series, q.from, q.to, q.vfrom.zip(q.vto))?
     };
     let result = query::query_series(&state.pool, &req).await.map_err(|e| {
         // `{e:#}` prints the whole anyhow context chain on one line; plain
@@ -192,6 +200,64 @@ async fn get_series(
     }))
 }
 
+/// Query parameters for `GET /api/extent`.
+#[derive(Debug, Deserialize)]
+struct ExtentQuery {
+    /// View id.
+    view: String,
+}
+
+/// The `GET /api/extent` response: the view's data floor as Unix epoch
+/// milliseconds, or `null` when no series in the view has any data yet. The
+/// frontend clamps a zoom-out's left edge to it.
+#[derive(Debug, Serialize)]
+struct ExtentResponse {
+    floor_ms: Option<i64>,
+}
+
+/// `GET /api/extent`: the earliest sample timestamp across all of a view's bound
+/// series, so the frontend can stop a zoom-out at the first data point. An
+/// unknown view is a 404; a query failure is logged and surfaces as a 500.
+async fn get_extent(
+    State(state): State<AppState>,
+    Query(q): Query<ExtentQuery>,
+) -> Result<Json<ExtentResponse>, ApiError> {
+    // Resolve the uuid set against a snapshot, then drop it before the await.
+    let uuids = {
+        let dash = state.store.current();
+        view_bound_uuids(&dash, &q.view)?
+    };
+    let floor = query::query_view_floor(&state.pool, &uuids)
+        .await
+        .map_err(|e| {
+            let cause = format!("{e:#}");
+            error!(error = %cause, view = %q.view, "extent query failed");
+            ApiError::Internal
+        })?;
+    Ok(Json(ExtentResponse {
+        floor_ms: floor.map(systemtime_to_ms),
+    }))
+}
+
+/// Collect every bound series' uuid in a view (derived `expr` series carry no
+/// uuid and are skipped). An unknown view is a 404. A uuid that won't parse is
+/// dropped rather than failing the whole lookup: the floor is a best-effort
+/// hint, so one bad config entry shouldn't blank it for the rest.
+fn view_bound_uuids(dash: &Dashboards, view: &str) -> Result<Vec<Uuid>, ApiError> {
+    let view = dash
+        .views
+        .iter()
+        .find(|v| v.id == view)
+        .ok_or_else(|| ApiError::NotFound(format!("unknown view '{view}'")))?;
+    Ok(view
+        .panels
+        .iter()
+        .flat_map(|p| p.series.iter())
+        .filter_map(|s| s.uuid.as_deref())
+        .filter_map(|u| Uuid::parse_str(u).ok())
+        .collect())
+}
+
 /// Locate a series by `(view, panel, series)` and build its [`SeriesRequest`].
 ///
 /// Pure and DB-free (unit-tested offline): an unknown view/panel/series is a 404;
@@ -199,7 +265,8 @@ async fn get_series(
 /// those locally and must not query the store for them; a malformed `uuid` string
 /// is a 400. The `sub` comes from [`Series::resolved_sub`](crate::dashboard::Series::resolved_sub),
 /// the `agg` from the series, and the calendar bucket from the panel falling back
-/// to the view.
+/// to the view. The optional `vis` carries the visible `(from, to)` window whose
+/// span drives the bucket width; absent, it defaults to the scanned `[from, to]`.
 fn resolve_request(
     dash: &Dashboards,
     view: &str,
@@ -207,7 +274,9 @@ fn resolve_request(
     series: usize,
     from_ms: i64,
     to_ms: i64,
+    vis: Option<(i64, i64)>,
 ) -> Result<SeriesRequest, ApiError> {
+    let (vfrom_ms, vto_ms) = vis.unwrap_or((from_ms, to_ms));
     let view = dash
         .views
         .iter()
@@ -241,7 +310,9 @@ fn resolve_request(
         kind: series_ref.kind,
         from: ms_to_systemtime(from_ms),
         to: ms_to_systemtime(to_ms),
-        bucket: panel_ref.bucket.or(view.bucket),
+        vis_from: ms_to_systemtime(vfrom_ms),
+        vis_to: ms_to_systemtime(vto_ms),
+        bucket: panel_ref.bucket.clone().or_else(|| view.bucket.clone()),
     })
 }
 
@@ -294,7 +365,7 @@ mod tests {
     use loxtap::config::TimescaleConfig;
     use tower::ServiceExt as _;
 
-    use crate::dashboard::{Agg, Bucket};
+    use crate::dashboard::{Agg, Bucket, BucketSpec};
 
     /// A dashboards set exercising the resolver's branches: a bound and a derived
     /// series in one panel, a view-level calendar bucket, and a bad-uuid series.
@@ -448,7 +519,7 @@ views:
     #[test]
     fn resolve_binds_a_series() {
         let dash = dashboards();
-        let req = resolve_request(&dash, "main", 0, 0, 1_000, 2_000).unwrap();
+        let req = resolve_request(&dash, "main", 0, 0, 1_000, 2_000, None).unwrap();
         assert_eq!(
             req.uuid,
             Uuid::parse_str("deadbeef-0000-0000-0000-000000000001").unwrap()
@@ -458,6 +529,21 @@ views:
         assert_eq!(req.bucket, None);
         assert_eq!(req.from, UNIX_EPOCH + Duration::from_millis(1_000));
         assert_eq!(req.to, UNIX_EPOCH + Duration::from_millis(2_000));
+        // No visible window sent -> it defaults to the scanned [from, to].
+        assert_eq!(req.vis_from, req.from);
+        assert_eq!(req.vis_to, req.to);
+    }
+
+    #[test]
+    fn resolve_carries_a_separate_visible_window() {
+        let dash = dashboards();
+        // The scanned window is padded wider than the visible one; the visible
+        // window is what should drive the bucket width, so it must survive intact.
+        let req = resolve_request(&dash, "main", 0, 0, 500, 3_000, Some((1_000, 2_000))).unwrap();
+        assert_eq!(req.from, UNIX_EPOCH + Duration::from_millis(500));
+        assert_eq!(req.to, UNIX_EPOCH + Duration::from_millis(3_000));
+        assert_eq!(req.vis_from, UNIX_EPOCH + Duration::from_millis(1_000));
+        assert_eq!(req.vis_to, UNIX_EPOCH + Duration::from_millis(2_000));
     }
 
     #[test]
@@ -465,8 +551,8 @@ views:
         let dash = dashboards();
         // The yearly view carries bucket: month; its panel omits one, so the
         // request inherits it via panel.bucket.or(view.bucket).
-        let req = resolve_request(&dash, "yearly", 0, 0, 0, 1).unwrap();
-        assert_eq!(req.bucket, Some(Bucket::Month));
+        let req = resolve_request(&dash, "yearly", 0, 0, 0, 1, None).unwrap();
+        assert_eq!(req.bucket, Some(BucketSpec::Fixed(Bucket::Month)));
         // sub omitted on the series -> the default value channel.
         assert_eq!(req.sub, "value");
         assert_eq!(req.agg, Some(Agg::Delta));
@@ -475,14 +561,14 @@ views:
     #[test]
     fn resolve_rejects_a_derived_series() {
         let dash = dashboards();
-        let err = resolve_request(&dash, "main", 0, 1, 0, 1).unwrap_err();
+        let err = resolve_request(&dash, "main", 0, 1, 0, 1, None).unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
     }
 
     #[test]
     fn resolve_rejects_a_bad_uuid() {
         let dash = dashboards();
-        let err = resolve_request(&dash, "bad", 0, 0, 0, 1).unwrap_err();
+        let err = resolve_request(&dash, "bad", 0, 0, 0, 1, None).unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
     }
 
@@ -490,15 +576,43 @@ views:
     fn resolve_unknown_view_panel_series_is_not_found() {
         let dash = dashboards();
         assert!(matches!(
-            resolve_request(&dash, "nope", 0, 0, 0, 1).unwrap_err(),
+            resolve_request(&dash, "nope", 0, 0, 0, 1, None).unwrap_err(),
             ApiError::NotFound(_)
         ));
         assert!(matches!(
-            resolve_request(&dash, "main", 9, 0, 0, 1).unwrap_err(),
+            resolve_request(&dash, "main", 9, 0, 0, 1, None).unwrap_err(),
             ApiError::NotFound(_)
         ));
         assert!(matches!(
-            resolve_request(&dash, "main", 0, 9, 0, 1).unwrap_err(),
+            resolve_request(&dash, "main", 0, 9, 0, 1, None).unwrap_err(),
+            ApiError::NotFound(_)
+        ));
+    }
+
+    // --- view_bound_uuids (pure) ---
+
+    #[test]
+    fn bound_uuids_collect_bound_and_skip_derived() {
+        let dash = dashboards();
+        // main has one bound series (uuid ...001) and one derived (expr a+1).
+        assert_eq!(
+            view_bound_uuids(&dash, "main").unwrap(),
+            vec![Uuid::parse_str("deadbeef-0000-0000-0000-000000000001").unwrap()]
+        );
+    }
+
+    #[test]
+    fn bound_uuids_drop_an_unparseable_uuid() {
+        let dash = dashboards();
+        // bad's only series carries "not-a-uuid": dropped, not fatal.
+        assert!(view_bound_uuids(&dash, "bad").unwrap().is_empty());
+    }
+
+    #[test]
+    fn bound_uuids_unknown_view_is_not_found() {
+        let dash = dashboards();
+        assert!(matches!(
+            view_bound_uuids(&dash, "nope").unwrap_err(),
             ApiError::NotFound(_)
         ));
     }
@@ -513,5 +627,19 @@ views:
         let body = body_string(resp).await;
         assert!(body.contains("error"), "body: {body}");
         assert!(body.contains("derived"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn series_endpoint_accepts_the_visible_window_params() {
+        // vfrom/vto must deserialize through the query layer. The derived locator
+        // still rejects in resolve_request (before any DB call), so a "derived"
+        // 400 -- rather than a parse 400 -- proves the extra params went through.
+        let resp = get(
+            app(""),
+            "/api/series?view=main&panel=0&series=1&from=0&to=3000&vfrom=1000&vto=2000",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_string(resp).await.contains("derived"));
     }
 }
