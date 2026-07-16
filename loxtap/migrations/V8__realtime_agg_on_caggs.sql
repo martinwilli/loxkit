@@ -1,0 +1,27 @@
+-- Turn on real-time aggregation for both continuous aggregates.
+--
+-- A cagg created on TimescaleDB 2.13+ defaults to materialized_only = true, and
+-- V6/V7 never set it, so both tiers inherited that default: a query reads only
+-- the materialized buckets. Two consequences, both of which read as "missing
+-- data" on the dashboards even though raw readings are complete. First the tail:
+-- the refresh policy lags by its end_offset (1 hour for readings_1h, 1 day for
+-- readings_1d), so the newest bucket a reader sees is always that far behind now
+-- -- a "Live" panel that stops an hour ago. Second a refresh stall: while the
+-- scheduler is down the materialization watermark is frozen, and every bucket
+-- past it reads as empty instead of falling back to raw.
+--
+-- materialized_only = false rewrites a cagg query as the materialized rows below
+-- the watermark UNION ALL a live aggregation of raw above it, so the tail is
+-- always current and a frozen watermark degrades to "served from raw," not to a
+-- gap. The watermark is bucket-aligned, so no bucket is split across the seam
+-- and delta's last(last_val) - first(first_val) composes identically on either
+-- side. The live region is bounded by end_offset (cheap for the hourly tier;
+-- readings_1d's wider tail matters less, since loxweb rolls the calendar day and
+-- month tiers up from readings_1h anyway).
+--
+-- This covers the live tail only, not an interior hole left behind once the
+-- policy advances the watermark past an unmaterialized span -- scheduler health
+-- and a periodic reconcile stay a separate concern. A plain catalog change: no
+-- rematerialization, and reversible with SET (... = true).
+ALTER MATERIALIZED VIEW readings_1h SET (timescaledb.materialized_only = false);
+ALTER MATERIALIZED VIEW readings_1d SET (timescaledb.materialized_only = false);
