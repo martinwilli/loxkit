@@ -387,7 +387,7 @@
   // e.g. after a drag-zoom).
   // =========================================================================
 
-  var DEFAULT_RANGE = "now-24h";
+  var DEFAULT_RANGE = "now-3d";
 
   var state = {
     views: [],
@@ -970,13 +970,13 @@
   // =========================================================================
 
   var RANGE_PRESETS = [
-    { label: "1h", spec: "now-1h" },
-    { label: "6h", spec: "now-6h" },
-    { label: "24h", spec: "now-24h" },
+    { label: "1d", spec: "now-1d" },
+    { label: "3d", spec: "now-3d" },
     { label: "7d", spec: "now-7d" },
     { label: "30d", spec: "now-30d" },
     { label: "6M", spec: "now-6M" },
     { label: "1y", spec: "now-1y" },
+    { label: "3y", spec: "now-3y" },
   ];
 
   function renderTabs() {
