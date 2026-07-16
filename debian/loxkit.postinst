@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Fixed unprivileged users so each daemon can read its own 0640 config.
+        # adduser --system is idempotent across reinstalls. The real config is
+        # admin-created from the .example; if it exists already, fix its owner.
+        adduser --system --group --no-create-home --home /nonexistent loxtap
+        if [ -f /etc/loxkit/loxtap.yaml ]; then
+            chown root:loxtap /etc/loxkit/loxtap.yaml
+            chmod 0640 /etc/loxkit/loxtap.yaml
+        fi
+        adduser --system --group --no-create-home --home /nonexistent loxweb
+        if [ -f /etc/loxkit/loxweb.yaml ]; then
+            chown root:loxweb /etc/loxkit/loxweb.yaml
+            chmod 0640 /etc/loxkit/loxweb.yaml
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

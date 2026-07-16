@@ -1,0 +1,6 @@
+loxkit (0.1.0-1) resolute; urgency=medium
+
+  * Initial Debian packaging: the loxtap and loxweb daemons and their cargo build
+    rules.
+
+ -- Martin Willi <martin@strongswan.org>  Sun, 12 Jul 2026 17:30:52 +0200

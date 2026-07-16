@@ -1,1 +1,14 @@
 /target
+# dpkg-buildpackage drops the built package here (see debian/rules)
+/*.deb
+# ...and the rest a package build leaves behind: the dbgsym sibling, plus
+# debhelper's staging dir and bookkeeping under debian/ and our cargo_home.
+/*.ddeb
+/debian/.debhelper/
+/debian/cargo_home/
+/debian/loxkit/
+/debian/files
+/debian/debhelper-build-stamp
+/debian/*.substvars
+/debian/*.debhelper.log
+/debian/*.debhelper

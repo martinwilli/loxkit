@@ -1,0 +1,37 @@
+[Unit]
+Description=config-driven dashboards over a Loxone TimescaleDB store
+After=network-online.target postgresql.service
+Wants=network-online.target
+# give up (enter failed) after 5 rapid deaths: a terminal config error should
+# surface to the operator, not hammer-restart forever.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+# Skip cleanly (condition failed, not a failure) until the admin has created the
+# config and the dashboards file, so a fresh install does not fail-loop. The
+# dashboards path mirrors the shipped default in loxweb.yaml; adjust with a
+# drop-in if you relocate it. A present-but-broken file still hard-exits loxweb.
+ConditionPathExists=/etc/loxkit/loxweb.yaml
+ConditionPathExists=/etc/loxkit/dashboards.yaml
+
+[Service]
+Type=exec
+User=loxweb
+Group=loxweb
+ExecStart=/usr/bin/loxweb --config /etc/loxkit/loxweb.yaml
+Restart=on-failure
+RestartSec=5s
+# hardening: reads its config and binds a loopback TCP socket, writes nothing.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

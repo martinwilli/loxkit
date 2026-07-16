@@ -1,0 +1,7 @@
+# libyaml-rs is a pure-Rust reimplementation of libyaml, linked statically
+# into both binaries like every other Rust crate. Its embedded version strings
+# trip lintian's C-library detector, but nothing links the shared libyaml
+# (the package Depends on glibc and libgcc only), so there is no vendored
+# system library to track for security updates.
+loxkit: embedded-library libyaml [usr/bin/loxtap]
+loxkit: embedded-library libyaml [usr/bin/loxweb]

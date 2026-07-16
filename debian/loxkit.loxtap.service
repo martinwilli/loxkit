@@ -1,0 +1,35 @@
+[Unit]
+Description=uuid-stable Loxone to TimescaleDB bridge
+After=network-online.target postgresql.service
+Wants=network-online.target
+# give up (enter failed) after 5 rapid deaths: a terminal PinError/config error
+# should surface to the operator, not hammer-restart forever.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+# Skip cleanly (condition failed, not a failure) until the admin has created the
+# config, so a fresh install does not fail-loop. A present-but-broken config
+# still hard-exits the daemon.
+ConditionPathExists=/etc/loxkit/loxtap.yaml
+
+[Service]
+Type=exec
+User=loxtap
+Group=loxtap
+ExecStart=/usr/bin/loxtap --config /etc/loxkit/loxtap.yaml
+Restart=on-failure
+RestartSec=5s
+# hardening: no writable paths needed, reads /etc/machine-id + /proc hostname only.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,51 @@
+#!/usr/bin/make -f
+export CARGO_HOME := $(CURDIR)/debian/cargo_home
+# building the binary target directly (see below) skips dpkg-buildpackage,
+# which would otherwise set this from the control field; without it debhelper
+# assumes root and drops --root-owner-group, capturing the builder's uid.
+export DEB_RULES_REQUIRES_ROOT := no
+
+%:
+	dh $@
+
+# --workspace builds both members (loxtap and loxweb) from the virtual
+# workspace root, so dh_install finds both binaries under target/release.
+override_dh_auto_build:
+	cargo build --release --locked --workspace
+
+override_dh_auto_test:
+	cargo test --release --locked --workspace
+
+override_dh_auto_install:
+	# the binary is placed by debian/loxkit.install
+
+override_dh_auto_clean:
+	cargo clean
+	rm -rf debian/cargo_home
+
+override_dh_install:
+	dh_install
+	# Ship the samples under their .example.yaml names, never the real config.
+	# The admin copies one to /etc/loxkit/<name>.yaml and fills it in; that copy
+	# is not a package file, so dpkg never prompts on a config upgrade. The
+	# examples carry only placeholders, so they are world-readable.
+	install -D -m 0644 loxtap/config.example.yaml debian/loxkit/etc/loxkit/loxtap.example.yaml
+	install -D -m 0644 loxweb/config.example.yaml debian/loxkit/etc/loxkit/loxweb.example.yaml
+	install -D -m 0644 loxweb/dashboards.example.yaml debian/loxkit/etc/loxkit/dashboards.example.yaml
+
+# both units ship as debian/loxkit.<name>.service, so with package name loxkit
+# neither is the package-named unit dh would auto-install; each needs its own
+# --name pass to be installed, enabled and started: --name=loxtap for the ingest
+# daemon, --name=loxweb for the dashboard server. Each call restricts itself to
+# its named unit, so there is no double-enable. We do start on install, but each
+# unit carries a ConditionPathExists on its config, so a fresh box with no config
+# yet is skipped cleanly instead of fail-looping; it starts for real once the
+# admin drops the config in. Upgrades use dh's default restart-after-upgrade.
+override_dh_installsystemd:
+	dh_installsystemd --name=loxtap
+	dh_installsystemd --name=loxweb
+
+# emit the .deb into the source tree instead of the parent dir, so
+# `debian/rules binary` drops it right here (and nothing else).
+override_dh_builddeb:
+	dh_builddeb --destdir=$(CURDIR)

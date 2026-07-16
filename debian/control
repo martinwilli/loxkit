@@ -1,0 +1,19 @@
+Source: loxkit
+Section: net
+Priority: optional
+Maintainer: Martin Willi <martin@strongswan.org>
+Build-Depends: debhelper-compat (= 13), cargo, rustc (>= 1.85~)
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: loxkit
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser
+Description: uuid-stable Loxone to TimescaleDB bridge and dashboard server
+ A long-running daemon that authenticates to a Loxone Miniserver over its
+ websocket, resolves the uuid map, and writes a clean stream of uuid-keyed
+ readings into TimescaleDB. Keying every series on the stable uuid means a
+ rename in Loxone Config is a label change, never a new series.
+ .
+ Ships alongside it loxweb, a config-driven dashboard server that reads the
+ same TimescaleDB store and charts it from a declarative view definition.
