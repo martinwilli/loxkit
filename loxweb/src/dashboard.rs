@@ -143,7 +143,8 @@ pub struct Series {
     pub stack: Option<String>,
     /// How this series accumulates within its stack group. Absent is `samesign`
     /// (a mirrored `scale: -1` member stacks below zero); set `all` to stack
-    /// across signs, e.g. for a min-max band whose base goes negative.
+    /// across signs, e.g. for a min-max band whose base goes negative, or
+    /// `negative` to pin the member below zero regardless of its per-bucket sign.
     #[serde(default)]
     pub stack_strategy: StackStrategy,
     /// Multiplier applied to values, e.g. `-1` to mirror below zero or `0.001`
@@ -438,6 +439,12 @@ pub enum StackStrategy {
     /// `min`) can dip below zero: the `max - min` height must stack onto that
     /// negative base to reach `max`, which `samesign` refuses.
     All,
+    /// Only ever accumulate onto the negative side of zero, whatever the value's
+    /// own sign in a given bucket. `samesign` picks the side per bucket from that
+    /// sign, so a derived series flips to the wrong side whenever measurement
+    /// noise nudges it across zero; pinning it `negative` keeps a series that must
+    /// live below zero (e.g. a mirrored import derived from counter deltas) there.
+    Negative,
 }
 
 /// The aggregation applied when bucketing a bound series. No default: an absent
@@ -984,7 +991,7 @@ views:
       - title: Live
         series:
           - {id: prod, label: Production,  uuid: "deadbeef-0000-0000-0000-000000000004", agg: max, type: bar, stack: gen, stack_strategy: all}
-          - {id: cons, label: Consumption, uuid: "deadbeef-0000-0000-0000-000000000005", agg: max, type: bar, stack: use, scale: -1}
+          - {id: cons, label: Consumption, uuid: "deadbeef-0000-0000-0000-000000000005", agg: max, type: bar, stack: use, scale: -1, stack_strategy: negative}
           - {label: Net, expr: "prod + cons", type: line, interp: smooth}
   - id: yearly
     title: Yearly
@@ -1035,11 +1042,11 @@ views:
         assert_eq!(cop.interp, Interp::Smooth);
         assert_eq!(cop.uuid, None);
 
-        // A mirrored (scale -1) member of a stack group.
+        // A mirrored (scale -1) member of a stack group, pinned below zero.
         let cons = &dbs.views[0].panels[1].series[1];
         assert_eq!(cons.scale, -1.0);
         assert_eq!(cons.stack.as_deref(), Some("use"));
-        assert_eq!(cons.stack_strategy, StackStrategy::Samesign);
+        assert_eq!(cons.stack_strategy, StackStrategy::Negative);
 
         // A stack member that opts into across-sign accumulation.
         let prod = &dbs.views[0].panels[1].series[0];

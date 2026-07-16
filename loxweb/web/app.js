@@ -676,6 +676,8 @@
         // samesign (default): positive values stack up, negative (scale:-1)
         // stack down, so a mirrored series lands below zero within its group.
         // "all" stacks across signs, for a band whose base dips below zero.
+        // "negative" pins a series below zero whatever its per-bucket sign, so a
+        // derived member stays down even when noise nudges its value positive.
         opt.stackStrategy = s.stack_strategy || "samesign";
       }
       if (opt.type === "line") {

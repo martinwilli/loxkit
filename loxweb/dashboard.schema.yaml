@@ -299,9 +299,11 @@ $defs:
     description: >-
       How a series accumulates within its stack group. samesign keeps positive
       and negative values on their own side of zero; all accumulates across signs
-      (needed for a min-max band whose base goes negative).
+      (needed for a min-max band whose base goes negative); negative pins the
+      member below zero regardless of its per-bucket sign (for a derived series
+      that must stay there even when noise nudges its value across zero).
     type: string
-    enum: [samesign, all]
+    enum: [samesign, all, negative]
     default: samesign
 
   agg:
