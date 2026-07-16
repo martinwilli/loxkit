@@ -103,6 +103,21 @@ systemctl start loxtap loxweb
 loxtap applies its schema on first run and begins ingesting; loxweb serves the
 dashboards you describe.
 
+## Documentation
+
+Three guides under `doc/` cover standing the stack up:
+
+- [doc/TIMESCALEDB-SETUP.md](doc/TIMESCALEDB-SETUP.md) — install and configure
+  TimescaleDB on Ubuntu.
+- [doc/LOXTAP-CONFIG.md](doc/LOXTAP-CONFIG.md) — the loxtap ingest daemon's config
+  file, including the first-connect server-key pin workflow.
+- [doc/LOXWEB-CONFIG.md](doc/LOXWEB-CONFIG.md) — the loxweb server config and a
+  dashboard walkthrough.
+
+The dashboards file has a full key-by-key reference in
+[loxweb/README.md](loxweb/README.md) and a machine-readable JSON Schema at
+[loxweb/dashboard.schema.yaml](loxweb/dashboard.schema.yaml).
+
 ## License
 
 MIT. loxweb vendors Apache ECharts, distributed under Apache-2.0 (see
