@@ -58,12 +58,12 @@ views:
 | Key | Meaning |
 |-----|---------|
 | `uuid` | Bound series: the store series to read (a `series_meta.uuid`). |
-| `sub` | The sub-channel; defaults to `value`. Documentary — the uuid identifies the series. |
 | `agg` | `avg` \| `max` \| `min` \| `median` \| `last` (plain), or `delta` \| `integral` (counter / time-weighted). Absent resolves from the series' stored kind. |
 | `expr` | Derived series: `+ - * /`, parens, constants, and sibling series `id`s. Evaluated in declaration order, so a derived series may reference an earlier one. |
 | `type` | `line` (default) or `bar`; may be mixed in one panel. |
 | `axis` | Which declared axis `id` the series is drawn against. |
 | `stack` | Series sharing a group stack together; a `scale: -1` series stacks below zero within its group. |
+| `stack_strategy` | `samesign` (default) keeps mirrored (`scale: -1`) members below zero; `all` stacks across signs, for a min-max band whose base goes negative. |
 | `scale` | Multiplier applied to every value, e.g. `-1` to mirror or `0.001` to rescale units. |
 | `color` | A CSS color; absent uses the default palette. |
 | `interp` | `linear` (default), `smooth`, or `step`. |
@@ -73,8 +73,10 @@ views:
 ### Axes
 
 Up to three y-axes per panel. Each has an `id` (referenced by `series.axis`), a
-`side` (`left`/`right`), an optional `unit` label, and optional `min`/`max`. A
-panel with no `axes` gets a single implicit axis.
+`side` (`left`/`right`), an optional `unit` label, and optional `min`/`max`. By
+default a value axis includes the zero baseline; set `fit: true` to let it hug
+the data range instead (an explicit `min`/`max` still pins that bound). A panel
+with no `axes` gets a single implicit axis.
 
 ### Bucketing
 
@@ -104,6 +106,22 @@ the compact `<count><unit>` grammar of `range` — `s`/`m`/`h`/`d`/`w`/`M`/`y`, 
 lowercase `m` minutes and uppercase `M` months. The `every` unit decides the rest:
 a **calendar** unit (`d`/`w`/`M`/`y`) buckets on local boundaries, a **clock** unit
 (`s`/`m`/`h`) in plain wall time. `upto` thresholds must strictly increase.
+
+### Schema
+
+A machine-readable JSON Schema (draft 2020-12) for this file ships alongside it
+at `dashboard.schema.yaml`. It pins the accepted keys — matching the loader,
+which rejects unknown ones — and carries the field docs, so an editor can offer
+completion and flag typos as you edit. Point your editor's YAML language server
+at it with a first-line comment in the config:
+
+```yaml
+# yaml-language-server: $schema=./dashboard.schema.yaml
+```
+
+A few invariants live in the schema's descriptions rather than its rules — axis
+references resolving within a panel, `expr` naming real siblings without cycles,
+schedule thresholds increasing — and are enforced when the file is loaded.
 
 ## Seeding synthetic data for the example
 

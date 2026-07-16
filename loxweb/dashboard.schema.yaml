@@ -1,0 +1,321 @@
+# loxweb dashboards config schema.
+#
+# A machine-readable JSON Schema (draft 2020-12, written as YAML) for the
+# dashboards file loxweb loads: views[] -> panels[] -> axes[] + series[]. It is
+# the companion to the "by example" prose in README.md; the example config
+# carries a `# yaml-language-server: $schema=./dashboard.schema.yaml` line so an
+# editor gives completion and validation against this file.
+#
+# additionalProperties is false on every object, matching the loader's serde
+# deny_unknown_fields: a misspelled or obsolete key is an error, not a silent
+# no-op. A few invariants the loader enforces at runtime cannot be expressed in
+# JSON Schema (axis references must resolve within the same panel, expr must name
+# real sibling ids with no cycles, schedule thresholds must strictly increase);
+# those live in the descriptions here and are re-checked when the file is loaded.
+
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://loxkit.local/loxweb/dashboard.schema.yaml"
+title: loxweb dashboards
+description: >-
+  A dashboards file: a list of views, each a tab of panels, each panel a set of
+  y-axes and the series drawn against them. A series is either bound to a store
+  uuid or derived from an arithmetic expression over its sibling series.
+type: object
+additionalProperties: false
+required: [views]
+properties:
+  views:
+    description: The views, each a tab of panels.
+    type: array
+    minItems: 1
+    items:
+      $ref: "#/$defs/view"
+
+$defs:
+
+  view:
+    description: One named tab of panels sharing a default time window.
+    type: object
+    additionalProperties: false
+    required: [id, title, panels]
+    properties:
+      id:
+        description: Stable id, used in URLs and API paths.
+        type: string
+      title:
+        description: Human title.
+        type: string
+      range:
+        description: >-
+          Default time window as a relative expression now-<n>{s,m,h,d,w,M,y}
+          (e.g. now-6M). Absent means the app default.
+        type: string
+      bucket:
+        description: >-
+          Bucketing policy for this view, inherited by panels that omit their
+          own. Absent lets the engine tier-route the bucket width by window span.
+        $ref: "#/$defs/bucketSpec"
+      panels:
+        description: The panels in this view.
+        type: array
+        minItems: 1
+        items:
+          $ref: "#/$defs/panel"
+
+  panel:
+    description: One chart, a set of declared y-axes and the series drawn on them.
+    type: object
+    additionalProperties: false
+    required: [title, series]
+    properties:
+      title:
+        description: Panel title.
+        type: string
+      height:
+        description: Relative height hint in grid rows; layout is otherwise automatic.
+        type: integer
+        minimum: 1
+      bucket:
+        description: Bucketing policy for this panel, overriding the view's.
+        $ref: "#/$defs/bucketSpec"
+      axes:
+        description: >-
+          Declared y-axes a series can target by id; up to three per panel.
+          Empty or omitted means a single implicit axis.
+        type: array
+        items:
+          $ref: "#/$defs/axis"
+      series:
+        description: The series drawn in this panel.
+        type: array
+        minItems: 1
+        items:
+          $ref: "#/$defs/series"
+
+  axis:
+    description: A declared y-axis a series can be pinned to.
+    type: object
+    additionalProperties: false
+    required: [id]
+    properties:
+      id:
+        description: Axis id, referenced by a series' axis key.
+        type: string
+      side:
+        description: Which side of the panel to draw the axis on.
+        $ref: "#/$defs/side"
+      unit:
+        description: Unit label; absent falls back to the series' stored unit.
+        type: string
+      min:
+        description: Fixed axis minimum.
+        type: number
+      max:
+        description: Fixed axis maximum.
+        type: number
+      fit:
+        description: >-
+          Hug the data range; skip the forced zero baseline (an explicit min/max
+          still pins that bound). A value axis otherwise always includes zero, so
+          a band of readings far from it is squashed into a sliver.
+        type: boolean
+        default: false
+
+  series:
+    description: >-
+      A single series, either bound to a store uuid (with an optional agg) or
+      derived from an expression over sibling series. Presentation keys are all
+      optional and carry a sensible default.
+    type: object
+    additionalProperties: false
+    properties:
+      id:
+        description: >-
+          Optional id, so a derived sibling can reference this series in an expr.
+          Required on a hidden series.
+        type: string
+      label:
+        description: Legend label; absent falls back to the series' stored name.
+        type: string
+      axis:
+        description: >-
+          Target axis id. Must name an axis declared in the SAME panel (checked
+          at load). Absent uses the panel's implicit/first axis.
+        type: string
+      type:
+        description: Draw as a line or bars.
+        $ref: "#/$defs/seriesType"
+      color:
+        description: Explicit CSS color; absent uses the default palette.
+        type: string
+      interp:
+        description: Line interpolation (ignored for bars).
+        $ref: "#/$defs/interp"
+      fill:
+        description: Fill the area under a line (ignored for bars).
+        type: boolean
+        default: false
+      hidden:
+        description: >-
+          Computed for expr references but never drawn (no legend, no line/bars),
+          e.g. a raw counter feeding a ratio. Requires an id, since a hidden
+          series is pointless unless a sibling references it.
+        type: boolean
+        default: false
+      stack:
+        description: Stack group; series sharing a group stack together.
+        type: string
+      stack_strategy:
+        description: >-
+          How this series accumulates within its stack group. Only meaningful
+          alongside stack.
+        $ref: "#/$defs/stackStrategy"
+      scale:
+        description: >-
+          Multiplier applied to every value, e.g. -1 to mirror below zero or
+          0.001 to rescale units.
+        type: number
+        default: 1
+      uuid:
+        description: >-
+          Bound series: the store series uuid to read. Mutually exclusive with
+          expr.
+        type: string
+        format: uuid
+        pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+      agg:
+        description: >-
+          Bound series: how to aggregate within a bucket. Absent resolves from
+          the stored kind (a counter takes delta, everything else avg). Not
+          allowed on a derived (expr) series.
+        $ref: "#/$defs/agg"
+      gapfill:
+        description: >-
+          Bound series: how an empty bucket is filled on the shared query grid.
+          Absent resolves a default from the chart type and aggregation: a line
+          carries the last value (locf), while a bar or a delta/integral reads an
+          empty bucket as 0 (none). Not allowed on a derived (expr) series.
+        $ref: "#/$defs/gapfill"
+      expr:
+        description: >-
+          Derived series: an arithmetic expression over sibling series ids, using
+          + - * /, parentheses, and numeric constants. Evaluated in declaration
+          order with no reference cycles (checked at load). Mutually exclusive
+          with uuid, agg, and gapfill.
+        type: string
+    oneOf:
+      - description: Bound series - a uuid, and no expr.
+        required: [uuid]
+        not:
+          required: [expr]
+      - description: Derived series - an expr, and no uuid/agg/gapfill.
+        required: [expr]
+        allOf:
+          - not:
+              required: [uuid]
+          - not:
+              required: [agg]
+          - not:
+              required: [gapfill]
+    allOf:
+      - description: A hidden series needs an id to be referenceable.
+        if:
+          properties:
+            hidden:
+              const: true
+          required: [hidden]
+        then:
+          required: [id]
+    # stack_strategy is a no-op without a stack group. The loader can't tell an
+    # explicit samesign from the default, so it does not enforce this; kept here
+    # as an editor hint, intentionally a touch stricter than the loader.
+    dependentRequired:
+      stack_strategy: [stack]
+
+  bucketSpec:
+    description: >-
+      A view/panel bucketing policy in one of two forms: the scalar day/month
+      calendar shorthand, or an array of {upto, every} rules (a zoom schedule
+      that picks the bucket width from the current window span).
+    oneOf:
+      - $ref: "#/$defs/bucketFixed"
+      - type: array
+        minItems: 1
+        items:
+          $ref: "#/$defs/bucketRule"
+
+  bucketFixed:
+    description: >-
+      Fixed calendar-unit shorthand. day and month are the two calendar
+      exceptions the span router skips, so a daily-reset counter charted with max
+      reads as one whole-day (or -month) total instead of fragmenting across
+      span-routed sub-day buckets. Each equals a one-rule always-on schedule.
+    type: string
+    enum: [day, month]
+
+  bucketRule:
+    description: >-
+      One schedule rule: for windows whose span is strictly below upto, bucket at
+      every. upto thresholds must strictly increase across the array (checked at
+      load).
+    type: object
+    additionalProperties: false
+    required: [upto, every]
+    properties:
+      upto:
+        description: Upper span threshold (exclusive) this rule applies below.
+        $ref: "#/$defs/bucketInterval"
+      every:
+        description: Bucket width to use when this rule matches.
+        $ref: "#/$defs/bucketInterval"
+
+  bucketInterval:
+    description: >-
+      A time granularity as the compact <count><unit> form (e.g. 10h, 1m, 1M).
+      The count must be positive. Units are case-sensitive: s=second, m=minute,
+      h=hour, d=day, w=week, M=month, y=year (lowercase m is minute, uppercase M
+      is month).
+    type: string
+    pattern: "^[0-9]+[smhdwMy]$"
+
+  side:
+    description: Which side of the panel an axis is drawn on.
+    type: string
+    enum: [left, right]
+
+  seriesType:
+    description: A series' chart type.
+    type: string
+    enum: [line, bar]
+    default: line
+
+  interp:
+    description: Line interpolation between points.
+    type: string
+    enum: [linear, smooth, step]
+    default: linear
+
+  stackStrategy:
+    description: >-
+      How a series accumulates within its stack group. samesign keeps positive
+      and negative values on their own side of zero; all accumulates across signs
+      (needed for a min-max band whose base goes negative).
+    type: string
+    enum: [samesign, all]
+    default: samesign
+
+  agg:
+    description: >-
+      The aggregation applied when bucketing a bound series. avg/max/min/median/
+      last are plain reducers; delta is the counter delta over the bucket and
+      integral its time-weighted integral.
+    type: string
+    enum: [avg, max, min, median, last, delta, integral]
+
+  gapfill:
+    description: >-
+      How an empty bucket gets a value on the shared query grid: locf carries the
+      last observed value forward, interpolate linearly interpolates between the
+      surrounding points, none leaves it empty (read as 0).
+    type: string
+    enum: [locf, interpolate, none]

@@ -200,16 +200,22 @@
     return m;
   }
 
-  // Sorted [[t, value], ...] from a Map<t, value>; non-finite values become
-  // null so ECharts renders a gap rather than a bogus point.
-  function mapToPoints(m) {
+  // Sorted [[t, value], ...] from a Map<t, value>. An empty/non-finite bucket is
+  // a gap: an unstacked series keeps it null so ECharts breaks the line there,
+  // but a stacked one (`zeroFill`) drops it to 0 so the stack stays solid rather
+  // than tearing where one member is missing.
+  function mapToPoints(m, zeroFill) {
     var ts = Array.from(m.keys()).sort(function (a, b) {
       return a - b;
     });
     var out = [];
     for (var i = 0; i < ts.length; i += 1) {
       var v = m.get(ts[i]);
-      out.push([ts[i], isFinite(v) ? v : null]);
+      if (v === null || v === undefined || !isFinite(v)) {
+        out.push([ts[i], zeroFill ? 0 : null]);
+      } else {
+        out.push([ts[i], v]);
+      }
     }
     return out;
   }
@@ -240,7 +246,9 @@
       for (r = 0; r < refs.length; r += 1) {
         g = gridById.get(refs[r]);
         var v = g ? g.get(t) : undefined;
-        if (v === undefined) {
+        if (v === undefined || v === null) {
+          // A referenced sibling has no value here (missing or an unfilled gap),
+          // so the derived value is a gap too rather than composing with a 0.
           ok = false;
           break;
         }
@@ -269,7 +277,10 @@
       if (s.uuid !== undefined && s.uuid !== null) {
         var raw = boundPoints[idx] || [];
         for (var p = 0; p < raw.length; p += 1) {
-          valMap.set(raw[p][0], raw[p][1] * scale);
+          // Keep an unfilled gap null: scaling it (null * scale) would coerce it
+          // to 0 and put back the dive this whole change removes.
+          var rv = raw[p][1];
+          valMap.set(raw[p][0], rv === null ? null : rv * scale);
         }
       } else if (s.expr) {
         var base = evalDerivedGrid(s.expr, gridById);
@@ -281,7 +292,9 @@
       if (s.id) {
         gridById.set(s.id, valMap);
       }
-      out.push(mapToPoints(valMap));
+      // gridById keeps the null gaps (so an expr composing this series sees the
+      // gap, not a 0); the drawn points zero-fill only when this series stacks.
+      out.push(mapToPoints(valMap, !!s.stack));
     }
     return out;
   }
@@ -374,7 +387,7 @@
   // e.g. after a drag-zoom).
   // =========================================================================
 
-  var DEFAULT_RANGE = "now-24h";
+  var DEFAULT_RANGE = "now-3d";
 
   var state = {
     views: [],
@@ -608,6 +621,9 @@
           name: ax.unit || axisStoreUnit[i] || "",
           min: ax.min !== undefined ? ax.min : null,
           max: ax.max !== undefined ? ax.max : null,
+          // Default (fit:false) keeps ECharts' zero baseline; fit:true lets
+          // the axis hug the data range instead.
+          scale: !!ax.fit,
           nameTextStyle: { color: chrome.ink2 },
           axisLine: { lineStyle: { color: chrome.axis } },
           axisLabel: { color: chrome.muted },
@@ -657,9 +673,10 @@
       };
       if (s.stack) {
         opt.stack = s.stack;
-        // samesign: positive values stack up, negative (scale:-1) stack down,
-        // so a mirrored series lands below zero within its group.
-        opt.stackStrategy = "samesign";
+        // samesign (default): positive values stack up, negative (scale:-1)
+        // stack down, so a mirrored series lands below zero within its group.
+        // "all" stacks across signs, for a band whose base dips below zero.
+        opt.stackStrategy = s.stack_strategy || "samesign";
       }
       if (opt.type === "line") {
         var mode = INTERP[s.interp] || INTERP.linear;
@@ -953,13 +970,13 @@
   // =========================================================================
 
   var RANGE_PRESETS = [
-    { label: "1h", spec: "now-1h" },
-    { label: "6h", spec: "now-6h" },
-    { label: "24h", spec: "now-24h" },
+    { label: "1d", spec: "now-1d" },
+    { label: "3d", spec: "now-3d" },
     { label: "7d", spec: "now-7d" },
     { label: "30d", spec: "now-30d" },
     { label: "6M", spec: "now-6M" },
     { label: "1y", spec: "now-1y" },
+    { label: "3y", spec: "now-3y" },
   ];
 
   function renderTabs() {

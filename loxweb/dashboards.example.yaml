@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=./dashboard.schema.yaml
 # loxweb sample dashboards. Copy this file, point config.yaml at it, and edit.
 #
 # Everything here is SYNTHETIC: invented rooms and made-up uuids
@@ -12,10 +13,11 @@
 # meaning; everything else takes a sensible default.
 #
 # Every bound series is bucketed onto the same dense grid so a panel's stack
-# lines up. `gapfill` picks how an empty bucket fills, and defaults to `none`
-# (leave empty, read as 0). Set `locf` to carry the last value across a gap (a
-# level like a temperature or a valve position), or `interpolate` to ramp
-# between points (a coarsely sampled smooth signal).
+# lines up. `gapfill` picks how an empty bucket fills. The default depends on the
+# series: a line carries the last value (`locf`), while a bar or a delta/integral
+# reads as 0 (`none`). Set it explicitly to override -- `locf` to hold a level
+# across a gap (a temperature or a valve position), `interpolate` to ramp between
+# points (a coarsely sampled smooth signal), or `none` to leave empties at 0.
 
 views:
   # A short window. Panels mix bars and lines, pin series to their own axes,
@@ -38,8 +40,9 @@ views:
             unit: "%"
             min: 0
             max: 100
-          - id: ratio            # unitless, third axis
+          - id: ratio            # unitless third axis; hug the data, no zero baseline
             side: right
+            fit: true
         series:
           - id: t_in
             label: Indoor Temp
@@ -98,7 +101,6 @@ views:
           - id: prod
             label: Production
             uuid: deadbeef-0000-0000-0000-000000000006
-            sub: prodCurrDay
             agg: max
             type: bar
             stack: flow
@@ -106,7 +108,6 @@ views:
           - id: grid_in
             label: Grid Import
             uuid: deadbeef-0000-0000-0000-000000000007
-            sub: consCurrDay
             agg: max
             type: bar
             stack: flow
@@ -114,7 +115,6 @@ views:
           - id: cons
             label: Consumption
             uuid: deadbeef-0000-0000-0000-000000000008
-            sub: consTotal
             agg: max
             type: bar
             stack: flow
@@ -149,7 +149,6 @@ views:
           - id: import_kwh
             label: Import
             uuid: deadbeef-0000-0000-0000-000000000009
-            sub: total
             agg: delta
             type: bar
             stack: e
@@ -158,7 +157,6 @@ views:
           - id: export_kwh
             label: Export
             uuid: deadbeef-0000-0000-0000-00000000000a
-            sub: total
             agg: delta
             type: bar
             stack: e
@@ -184,7 +182,6 @@ views:
         series:
           - label: Meter
             uuid: deadbeef-0000-0000-0000-00000000000c
-            sub: total
             agg: delta
             type: bar
             axis: kwh2

@@ -117,10 +117,6 @@ const DAY_LADDER: &[(u64, &str)] = &[
 pub struct SeriesRequest {
     /// The stable state uuid — the one thing that keys a series in the store.
     pub uuid: Uuid,
-    /// The sub-channel, carried for provenance/logging only. `readings` keys on
-    /// uuid alone (there is no `sub` column), so this never enters a WHERE
-    /// clause; the uuid already pins the exact series.
-    pub sub: String,
     /// The aggregation. `None` means "resolve from `series_meta.agg_mode`" at
     /// query time (gauge → avg, counter → delta).
     pub agg: Option<Agg>,
@@ -155,8 +151,12 @@ pub struct SeriesRequest {
 pub struct Point {
     /// Bucket start (the `time_bucket` boundary).
     pub t: SystemTime,
-    /// The aggregated value.
-    pub v: f64,
+    /// The aggregated value. `None` for an empty bucket that the gapfill mode
+    /// leaves unfilled — a `locf`/`interpolate` edge with nothing to carry from
+    /// (a leading gap before the first in-window sample) — so the frontend draws
+    /// a gap there instead of a line diving to zero. A `none`-gapfill bucket is a
+    /// true zero (a counter that did not move, a bar that was off), so it is 0.
+    pub v: Option<f64>,
 }
 
 /// The result of a series query: the dense points plus the resolved unit label
@@ -466,11 +466,20 @@ pub async fn query_series(pool: &Pool, req: &SeriesRequest) -> Result<SeriesResu
     let mut points = Vec::with_capacity(rows.len());
     for row in rows {
         let t: SystemTime = row.get(0);
-        // Gapfill emits a row for every bucket in the window; an empty one is
-        // NULL (a leading gap before the first sample, or an accumulation gap).
-        // Coalesce to 0 so every series returns the identical dense grid and a
-        // panel's stack aligns index-for-index.
-        let v = row.get::<_, Option<f64>>(1).unwrap_or(0.0);
+        // Gapfill emits a row for every bucket, so the grid stays dense (aligned
+        // index-for-index for stacking) regardless of what fills an empty one.
+        // An empty bucket is NULL; how it reads depends on the gapfill mode. For
+        // `none` (bars, and delta/integral counters) an empty bucket is a genuine
+        // zero — no movement, off — so coalesce it. For locf/interpolate a NULL
+        // is an *unseedable* edge: a leading gap before the first in-window sample
+        // that locf cannot carry into (the WHERE clips the prior reading away). A
+        // fake 0 there dives the line to the baseline and drags the axis down, so
+        // keep it NULL and let the frontend draw a real gap.
+        let raw = row.get::<_, Option<f64>>(1);
+        let v = match gapfill {
+            Gapfill::None => Some(raw.unwrap_or(0.0)),
+            Gapfill::Locf | Gapfill::Interpolate => raw,
+        };
         points.push(Point { t, v });
     }
     Ok(SeriesResult {
@@ -961,7 +970,6 @@ mod tests {
         for agg in [Agg::Avg, Agg::Integral] {
             let req = SeriesRequest {
                 uuid,
-                sub: "value".to_owned(),
                 agg: Some(agg),
                 gapfill: None,
                 kind: SeriesType::Line,

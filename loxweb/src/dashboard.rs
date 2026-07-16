@@ -2,7 +2,7 @@
 //!
 //! A dashboard is a list of *views*; a view is a list of *panels*; a panel is
 //! `axes[] + series[]`. Every series is either **bound** (a `uuid` plus an
-//! optional `sub`/`agg`, read straight from the store) or **derived** (an
+//! optional `agg`, read straight from the store) or **derived** (an
 //! `expr` computed from its sibling series). Presentation keys are all optional
 //! and appear only when they carry meaning, so the common series is one line.
 //!
@@ -27,17 +27,13 @@ use arc_swap::ArcSwap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tracing::{error, info};
 
-/// loxtap's default sub-channel: a control's primary state carries no sub-name
-/// of its own, so a bound series that omits `sub` resolves to this. Mirrors the
-/// daemon's structure resolution (a plain `value` state).
-pub const DEFAULT_SUB: &str = "value";
-
 /// The whole dashboard set — the parsed contents of `dashboards.yaml`.
 ///
 /// Also `Serialize`: the HTTP layer hands the current snapshot straight to the
 /// frontend as JSON. The `skip_serializing_if` on the optional fields keeps that
 /// JSON as terse as the YAML — an absent key stays absent, never `null`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Dashboards {
     /// The views, each a tab of panels.
     pub views: Vec<View>,
@@ -45,6 +41,7 @@ pub struct Dashboards {
 
 /// A view: one named tab of panels sharing a default time window.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct View {
     /// Stable id (used in URLs and API paths).
     pub id: String,
@@ -65,6 +62,7 @@ pub struct View {
 
 /// A panel: one chart, `axes[] + series[]`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Panel {
     /// Panel title.
     pub title: String,
@@ -85,6 +83,7 @@ pub struct Panel {
 
 /// A declared y-axis a series can be pinned to.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Axis {
     /// Axis id, referenced by `series.axis`.
     pub id: String,
@@ -100,10 +99,17 @@ pub struct Axis {
     /// Fixed axis maximum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
+    /// Let the axis hug the data range instead of forcing the zero baseline in.
+    /// A value axis otherwise always includes zero (the ECharts default), so a
+    /// band of readings far from it (room temperatures, say) is squashed into a
+    /// sliver at the top. An explicit `min`/`max` still pins that bound.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fit: bool,
 }
 
 /// A single series: either bound to a store uuid or derived from siblings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Series {
     /// Optional id, so a derived sibling can reference this series in an `expr`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,18 +141,20 @@ pub struct Series {
     /// Stack group; series sharing a group stack together.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack: Option<String>,
+    /// How this series accumulates within its stack group. Absent is `samesign`
+    /// (a mirrored `scale: -1` member stacks below zero); set `all` to stack
+    /// across signs, e.g. for a min-max band whose base goes negative.
+    #[serde(default)]
+    pub stack_strategy: StackStrategy,
     /// Multiplier applied to values, e.g. `-1` to mirror below zero or `0.001`
     /// to rescale units.
     #[serde(default = "default_scale")]
     pub scale: f64,
 
-    // --- binding: exactly one of {uuid (+sub,+agg)} or {expr} ---
+    // --- binding: exactly one of {uuid (+agg)} or {expr} ---
     /// Bound series: the store uuid to read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
-    /// Bound series: the sub-channel; omitted resolves to [`DEFAULT_SUB`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sub: Option<String>,
     /// Bound series: the aggregation. Absent is resolved later from
     /// `series_meta.agg_mode` (commit 3), so no default is imposed here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -161,15 +169,6 @@ pub struct Series {
     /// Derived series: an arithmetic expression over sibling series ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expr: Option<String>,
-}
-
-impl Series {
-    /// The sub-channel this bound series reads, applying loxtap's `value`
-    /// default when a control names no sub explicitly. Meaningless for a
-    /// derived series (which has no uuid); callers gate on the binding.
-    pub fn resolved_sub(&self) -> &str {
-        self.sub.as_deref().unwrap_or(DEFAULT_SUB)
-    }
 }
 
 /// A fixed calendar bucket, the scalar shorthand of a [`BucketSpec`]: `day` and
@@ -344,6 +343,7 @@ impl<'de> Deserialize<'de> for BucketInterval {
 /// One rule in a bucket schedule: for windows whose span is strictly less than
 /// `upto`, bucket at `every`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BucketRule {
     pub upto: BucketInterval,
     pub every: BucketInterval,
@@ -423,6 +423,21 @@ pub enum Interp {
     Smooth,
     /// Step (hold last value), e.g. for a valve position.
     Step,
+}
+
+/// How a series accumulates within its [`Series::stack`] group. Maps straight to
+/// the charting library's stack strategy of the same names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StackStrategy {
+    /// Positive and negative values accumulate on their own side of zero (the
+    /// default), so a `scale: -1` member lands below zero within the group.
+    #[default]
+    Samesign,
+    /// Accumulate across signs. Needed for a min-max band, whose base (the daily
+    /// `min`) can dip below zero: the `max - min` height must stack onto that
+    /// negative base to reach `max`, which `samesign` refuses.
+    All,
 }
 
 /// The aggregation applied when bucketing a bound series. No default: an absent
@@ -557,9 +572,9 @@ fn validate_panel(view: &View, panel: &Panel) -> anyhow::Result<()> {
                 loc(view, panel)
             ),
             (false, true) => {
-                if series.sub.is_some() || series.agg.is_some() || series.gapfill.is_some() {
+                if series.agg.is_some() || series.gapfill.is_some() {
                     bail!(
-                        "{}: derived {sref} must not carry sub/agg/gapfill (those apply only to a bound uuid series)",
+                        "{}: derived {sref} must not carry agg/gapfill (those apply only to a bound uuid series)",
                         loc(view, panel)
                     );
                 }
@@ -962,14 +977,14 @@ views:
           - {id: energy, side: left, unit: kWh}
           - {id: ratio, side: right, min: 0, max: 6}
         series:
-          - {id: heat,  label: Heat,  uuid: "deadbeef-0000-0000-0000-000000000001", sub: total, agg: delta, type: bar, axis: energy}
-          - {id: power, label: Power, uuid: "deadbeef-0000-0000-0000-000000000002", sub: total, agg: delta, type: bar, axis: energy}
+          - {id: heat,  label: Heat,  uuid: "deadbeef-0000-0000-0000-000000000001", agg: delta, type: bar, axis: energy}
+          - {id: power, label: Power, uuid: "deadbeef-0000-0000-0000-000000000002", agg: delta, type: bar, axis: energy}
           - {label: Temperature, uuid: "deadbeef-0000-0000-0000-000000000003", agg: avg, type: line, axis: ratio, color: "#4a7fb5"}
           - {label: COP, expr: "heat / power", type: line, axis: ratio, interp: smooth}
       - title: Live
         series:
-          - {id: prod, label: Production,  uuid: "deadbeef-0000-0000-0000-000000000004", sub: prodCurrDay, agg: max, type: bar, stack: gen}
-          - {id: cons, label: Consumption, uuid: "deadbeef-0000-0000-0000-000000000005", sub: consCurrDay, agg: max, type: bar, stack: use, scale: -1}
+          - {id: prod, label: Production,  uuid: "deadbeef-0000-0000-0000-000000000004", agg: max, type: bar, stack: gen, stack_strategy: all}
+          - {id: cons, label: Consumption, uuid: "deadbeef-0000-0000-0000-000000000005", agg: max, type: bar, stack: use, scale: -1}
           - {label: Net, expr: "prod + cons", type: line, interp: smooth}
   - id: yearly
     title: Yearly
@@ -1005,13 +1020,12 @@ views:
         assert_eq!(heat.kind, SeriesType::Bar);
         assert_eq!(heat.agg, Some(Agg::Delta));
         assert_eq!(heat.axis.as_deref(), Some("energy"));
-        assert_eq!(heat.resolved_sub(), "total");
         assert_eq!(heat.scale, 1.0);
         assert_eq!(heat.interp, Interp::Linear);
+        assert_eq!(heat.stack_strategy, StackStrategy::Samesign);
 
-        // sub omitted -> DEFAULT_SUB; agg deferred as None.
+        // agg deferred as None.
         let temp = &heating.series[2];
-        assert_eq!(temp.resolved_sub(), "value");
         assert_eq!(temp.color.as_deref(), Some("#4a7fb5"));
 
         // A derived series referencing two siblings.
@@ -1025,6 +1039,11 @@ views:
         let cons = &dbs.views[0].panels[1].series[1];
         assert_eq!(cons.scale, -1.0);
         assert_eq!(cons.stack.as_deref(), Some("use"));
+        assert_eq!(cons.stack_strategy, StackStrategy::Samesign);
+
+        // A stack member that opts into across-sign accumulation.
+        let prod = &dbs.views[0].panels[1].series[0];
+        assert_eq!(prod.stack_strategy, StackStrategy::All);
 
         // The derived Net references two siblings by id.
         let net = &dbs.views[0].panels[1].series[2];
@@ -1278,7 +1297,7 @@ views:
     #[test]
     fn rejects_a_derived_series_carrying_gapfill() {
         // gapfill applies to a bound uuid query; a derived series is computed
-        // client-side and must not carry it (same rule as sub/agg).
+        // client-side and must not carry it (same rule as agg).
         let yaml = r#"
 views:
   - id: v
@@ -1291,7 +1310,7 @@ views:
 "#;
         let err = DashboardStore::parse_and_validate(yaml).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("must not carry sub/agg/gapfill"), "message was: {msg}");
+        assert!(msg.contains("must not carry agg/gapfill"), "message was: {msg}");
     }
 
     #[test]
@@ -1327,6 +1346,22 @@ views:
     }
 
     #[test]
+    fn rejects_an_unknown_series_key() {
+        // A misspelled or obsolete key (here `colour` for `color`) must be a hard
+        // parse error, not a silently-dropped no-op that misleads the author.
+        let yaml = r#"
+views:
+  - id: v
+    title: V
+    panels:
+      - title: P
+        series:
+          - {label: A, uuid: "deadbeef-0000-0000-0000-000000000001", colour: red}
+"#;
+        assert!(DashboardStore::parse_and_validate(yaml).is_err());
+    }
+
+    #[test]
     fn parses_a_hidden_input_series() {
         // A hidden bound counter feeds a derived sibling but is not drawn; the
         // derived series that references it is visible as usual.
@@ -1343,6 +1378,27 @@ views:
         let dbs = DashboardStore::parse_and_validate(yaml).unwrap();
         assert!(dbs.views[0].panels[0].series[0].hidden);
         assert!(!dbs.views[0].panels[0].series[1].hidden);
+    }
+
+    #[test]
+    fn parses_an_axis_fit_flag() {
+        // fit:true opts an axis out of the zero baseline; absent it defaults
+        // to false (the ECharts zero-anchored behavior).
+        let yaml = r#"
+views:
+  - id: v
+    title: V
+    panels:
+      - title: P
+        axes:
+          - {id: temp, side: left, unit: "°C", fit: true}
+          - {id: pct, side: right, unit: "%"}
+        series:
+          - {uuid: "deadbeef-0000-0000-0000-000000000001", axis: temp}
+"#;
+        let dbs = DashboardStore::parse_and_validate(yaml).unwrap();
+        assert!(dbs.views[0].panels[0].axes[0].fit);
+        assert!(!dbs.views[0].panels[0].axes[1].fit);
     }
 
     #[test]
