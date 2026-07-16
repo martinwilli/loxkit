@@ -18,7 +18,8 @@ server_key_pin: "sha256:00000000000000000000000000000000000000000000000000000000
 token_uuid: 00000000-0000-0000-0000000000000000
 info: loxtap
 
-# Where resolved readings go. Milestone 1 ships only the debug sink.
+# Where resolved readings go. "debug" logs each reading; "timescale" writes to
+# the TimescaleDB store configured below.
 sink: debug
 
 # Fallback log level when RUST_LOG is unset (error, warn, info, debug, trace).
@@ -29,3 +30,12 @@ reconnect:
   backoff_base_secs: 2
   backoff_max_secs: 300
   keepalive_secs: 240
+
+# TimescaleDB sink connection, used when sink: timescale above. Plain Postgres
+# over a trusted LAN (no TLS). All values below are placeholders.
+timescale:
+  host: timescale.example
+  port: 5432
+  user: loxtap
+  password: password
+  dbname: loxtap

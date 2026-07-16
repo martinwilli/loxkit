@@ -114,6 +114,30 @@ pub struct Reading {
     pub value: f64,
 }
 
+/// How a series' values aggregate over time.
+///
+/// A gauge is an instantaneous reading (e.g. kW); a counter is a monotonic
+/// total (e.g. kWh). Gauge is the safe default: time-weighting an already
+/// instantaneous value is always correct, while only a true monotonic counter
+/// needs the delta treatment across buckets and resets. So a series with no
+/// explicit counter signal stays a gauge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AggMode {
+    #[default]
+    Gauge,
+    Counter,
+}
+
+impl AggMode {
+    /// The text form persisted in the `series_meta.agg_mode` column.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AggMode::Gauge => "gauge",
+            AggMode::Counter => "counter",
+        }
+    }
+}
+
 /// The mutable human labels resolved for a series uuid.
 ///
 /// A rename in Loxone Config changes these fields, never the uuid, which is
@@ -131,6 +155,10 @@ pub struct SeriesMeta {
     /// otherwise share name, room and category.
     pub sub: String,
     pub unit: Option<String>,
+    /// The series' aggregation kind, classified once at structure-parse from
+    /// Loxone's `visuType`; a sink persists it so downstream readers bucket by
+    /// kind rather than guessing from the unit.
+    pub agg_mode: AggMode,
 }
 
 #[cfg(test)]
@@ -161,6 +189,14 @@ mod tests {
         // First group little-endian: 0xdeadbeef -> ef be ad de.
         assert_eq!(&uuid.as_bytes()[0..4], &[0xef, 0xbe, 0xad, 0xde]);
         assert_eq!(uuid.to_lox_string(), "deadbeef-cafe-0042-0011223344556677");
+    }
+
+    #[test]
+    fn agg_mode_defaults_to_gauge_with_stable_strings() {
+        // Gauge is the safe default, and the strings feed the series_meta column.
+        assert_eq!(AggMode::default(), AggMode::Gauge);
+        assert_eq!(AggMode::Gauge.as_str(), "gauge");
+        assert_eq!(AggMode::Counter.as_str(), "counter");
     }
 
     #[test]

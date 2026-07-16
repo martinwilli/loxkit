@@ -92,7 +92,7 @@ type Established = (Transport, Session, Token, Structure);
 /// Returns `Ok` on a clean shutdown and `Err` on a terminal condition a human
 /// must resolve (a pin mismatch, bad credentials, or unsupported firmware).
 pub async fn run(config: &Config) -> anyhow::Result<()> {
-    let sink = sink::build(config.sink);
+    let sink = sink::build(config).await?;
     let mut shutdown = install_shutdown();
     let base = Duration::from_secs(config.reconnect.backoff_base_secs);
     let max = Duration::from_secs(config.reconnect.backoff_max_secs);
