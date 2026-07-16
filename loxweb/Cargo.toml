@@ -1,0 +1,33 @@
+[package]
+name = "loxweb"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+# The bridge crate, reused as a library: loxweb shares its TimescaleDB
+# connection config and wire model rather than redefining them.
+loxtap = { path = "../loxtap" }
+
+anyhow = "1.0.103"
+arc-swap = "1"
+# The HTTP layer: axum 0.8 router, JSON extractor, and graceful-shutdown serve.
+axum = "0.8.9"
+clap = { version = "4.6.1", features = ["derive"] }
+# Own read pool over Timescale. tokio-postgres/uuid are pinned to loxtap's
+# versions (feature with-uuid-1 binds a uuid::Uuid straight to a uuid column) so
+# the workspace lockfile stays coherent.
+deadpool-postgres = "0.14.1"
+serde = { version = "1.0.228", features = ["derive"] }
+# Explicit JSON for the {error: ...} bodies; pinned to loxtap's version.
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+tokio-postgres = { version = "0.7.18", features = ["with-uuid-1"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = "1.23.4"
+yaml_serde = "0.10.4"
+
+[dev-dependencies]
+# ServiceExt::oneshot drives the router in-memory for the offline HTTP tests.
+tower = { version = "0.5.3", features = ["util"] }

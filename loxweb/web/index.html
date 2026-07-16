@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!--
+      base_path support: the server rewrites the __BASE_PATH__ placeholder to
+      the configured sub-path (empty -> "/", "/app" -> "/app/") before serving
+      this file. With <base> set, every relative URL below resolves correctly
+      whether the app is mounted at the root or behind a reverse-proxy sub-path,
+      so the rest of the frontend needs zero base_path knowledge.
+    -->
+    <base href="__BASE_PATH__/" />
+    <title>loxweb</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header id="topbar">
+      <nav id="views" class="tabs" aria-label="Views"></nav>
+      <div id="ranges" class="ranges" aria-label="Time range"></div>
+    </header>
+    <main id="panels"></main>
+    <script src="echarts.min.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

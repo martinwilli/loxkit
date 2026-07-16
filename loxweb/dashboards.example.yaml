@@ -1,0 +1,73 @@
+# loxweb sample dashboards. Copy this file, point config.yaml at it, and edit.
+#
+# Everything here is SYNTHETIC: invented rooms and made-up uuids
+# (deadbeef-0000-0000-0000-0000000000NN), so it is safe to ship and doubles as
+# the schema documented by example. Replace the uuids with your own from
+#   SELECT uuid, sub, name, room, unit FROM series_meta;
+# and the labels/units with whatever those series mean.
+#
+# A series is either BOUND (a store uuid + how to aggregate it) or DERIVED (an
+# arithmetic `expr` over sibling series ids in the same panel, evaluated in the
+# browser in declaration order). Presentation keys appear only when they carry
+# meaning; everything else takes a sensible default.
+
+views:
+  # A short live window, auto-refreshing. Panels mix bars and lines, pin series
+  # to their own axes, stack, mirror below zero, and compute derived series.
+  - id: overview
+    title: Overview
+    range: now-2d          # per-view default window
+    refresh: 10s           # auto-refresh cadence (or: off)
+
+    panels:
+      - title: Climate            # mixed bars+line, three axes, a derived ratio
+        height: 10
+        axes:
+          - {id: temp,     side: left,  unit: "°C", min: 0, max: 40}
+          - {id: humidity, side: right, unit: "%",  min: 0, max: 100}
+          - {id: ratio,    side: right}                 # unitless, third axis
+        series:
+          - {id: t_in,  label: Indoor Temp,  uuid: deadbeef-0000-0000-0000-000000000001, agg: avg, type: line, axis: temp, color: "#4a7fb5", interp: smooth, fill: true}
+          - {id: t_out, label: Outdoor Temp, uuid: deadbeef-0000-0000-0000-000000000002, agg: avg, type: line, axis: temp, color: orange}
+          - {label: Humidity, uuid: deadbeef-0000-0000-0000-000000000003, agg: avg, type: bar, axis: humidity, color: "#8bc34a"}
+          - {label: In/Out Ratio, expr: "t_in / t_out", type: line, axis: ratio, interp: smooth}
+
+      - title: Actuators          # step interpolation and a median aggregate
+        axes:
+          - {id: pct, side: left, unit: "%", min: 0, max: 100}
+        series:
+          - {label: Valve Position, uuid: deadbeef-0000-0000-0000-000000000004, agg: last,   type: line, axis: pct, interp: step, color: "#e0663a"}
+          - {label: Median Flow,    uuid: deadbeef-0000-0000-0000-000000000005, agg: median, type: line, axis: pct, color: "#7f8c8d"}
+
+      - title: Power Flow         # stacking, a mirror below zero, chained derived
+        series:
+          - {id: prod,    label: Production,  uuid: deadbeef-0000-0000-0000-000000000006, sub: prodCurrDay, agg: max, type: bar, stack: flow, color: "#f6c343"}
+          - {id: grid_in, label: Grid Import, uuid: deadbeef-0000-0000-0000-000000000007, sub: consCurrDay, agg: max, type: bar, stack: flow, color: "#c0392b"}
+          - {id: cons,    label: Consumption, uuid: deadbeef-0000-0000-0000-000000000008, sub: consTotal,   agg: max, type: bar, stack: flow, scale: -1, color: "#2980b9"}
+          - {label: Self Use, expr: "prod - grid_in",  type: line, interp: smooth, color: "#27ae60"}
+          - {label: Gross,    expr: "prod - cons",      type: line, interp: smooth}
+
+  # A multi-year window bucketed into real calendar months. Counter series use
+  # a delta, a power gauge an integral; no auto-refresh.
+  - id: energy
+    title: Energy
+    range: now-3y
+    bucket: month          # real calendar months, local tz
+    refresh: off
+
+    panels:
+      - title: Monthly Energy     # delta + integral aggregates, a mirror, a net line
+        height: 12
+        axes:
+          - {id: kwh, side: left, unit: kWh, min: 0}
+        series:
+          - {id: import_kwh, label: Import,      uuid: deadbeef-0000-0000-0000-000000000009, sub: total, agg: delta,    type: bar,  stack: e, axis: kwh, color: "#c0392b"}
+          - {id: export_kwh, label: Export,      uuid: deadbeef-0000-0000-0000-00000000000a, sub: total, agg: delta,    type: bar,  stack: e, axis: kwh, scale: -1, color: "#27ae60"}
+          - {label: Heat Energy, uuid: deadbeef-0000-0000-0000-00000000000b, agg: integral, type: line, axis: kwh, color: "#e67e22"}
+          - {label: Net, expr: "import_kwh + export_kwh", type: line, axis: kwh}
+
+      - title: Meter                # a /1000 unit rescale (Wh -> kWh)
+        axes:
+          - {id: kwh2, side: left, unit: kWh}
+        series:
+          - {label: Meter, uuid: deadbeef-0000-0000-0000-00000000000c, sub: total, agg: delta, type: bar, axis: kwh2, scale: 0.001}

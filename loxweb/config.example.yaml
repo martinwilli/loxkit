@@ -1,0 +1,33 @@
+# loxweb sample configuration. Copy this file and fill in your own values.
+# All placeholders below are examples, not working credentials.
+
+# HTTP server. loxweb binds plain HTTP; terminate TLS at a reverse proxy.
+server:
+  # Address to bind. Keep it on the loopback (or a private interface) behind
+  # the proxy that terminates TLS.
+  bind: "127.0.0.1:8080"
+
+  # Mount point when the proxy serves loxweb under a sub-path, e.g. "/loxweb".
+  # Leave empty to serve at the root. The frontend uses relative URLs, so this
+  # is the only place the sub-path is configured.
+  base_path: ""
+
+# Read-only database connection. Point this at a role with SELECT on the store
+# loxtap fills; loxweb never writes. Keeping it separate from loxtap's own config
+# is what lets a least-privilege read-only role be used here. Plain Postgres
+# over a trusted LAN (no TLS). All values below are placeholders.
+timescale:
+  host: timescale.example
+  port: 5432
+  user: loxweb
+  password: password
+  dbname: loxtap
+  # Optional IANA timezone. Calendar bucketing (the monthly rollups) aligns to
+  # this zone; normally the store's default is already pinned, so leave unset.
+  # timezone: "Region/City"
+
+# Path to the dashboards file (hot-reloaded automatically when the file changes).
+dashboards: /etc/loxkit/dashboards.yaml
+
+# Fallback log level when RUST_LOG is unset (error, warn, info, debug, trace).
+log_level: info
