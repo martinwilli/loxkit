@@ -238,6 +238,7 @@ fn resolve_request(
         sub: series_ref.resolved_sub().to_owned(),
         agg: series_ref.agg,
         gapfill: series_ref.gapfill,
+        kind: series_ref.kind,
         from: ms_to_systemtime(from_ms),
         to: ms_to_systemtime(to_ms),
         bucket: panel_ref.bucket.or(view.bucket),

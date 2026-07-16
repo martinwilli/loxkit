@@ -31,10 +31,11 @@
 //! * `1 hour ≤ ideal < 1 day` → `readings_1h`, snapped up the whole-hour ladder.
 //! * `ideal ≥ 1 day` → `readings_1d`, snapped up the whole-day ladder (capped).
 //!
-//! Two aggregations override the tier: `delta` (counter) and `median` need
-//! per-point data that the caggs don't carry (V6 dropped the counter partial,
-//! and a percentile can't be composed from bucket rollups), so they force the
-//! raw tier regardless of span while keeping the span-appropriate bucket width.
+//! Two aggregations override the tier: `delta` and `median` need per-point data
+//! the caggs don't carry, so they force the raw tier regardless of span while
+//! keeping the span-appropriate bucket width. `delta` is last-minus-first over
+//! the bucket and the caggs store `last_val` but no `first_val` to compose it
+//! from; a percentile can't be composed from bucket rollups at all.
 //!
 //! `bucket: month` is the one calendar exception: real calendar months in local
 //! time via the 3-arg `time_bucket('1 month', <tcol>, current_setting('TimeZone'))`,
@@ -52,24 +53,29 @@ use uuid::Uuid;
 
 use loxtap::config::TimescaleConfig;
 
-use crate::dashboard::{Agg, Bucket, Gapfill};
+use crate::dashboard::{Agg, Bucket, Gapfill, SeriesType};
 
 /// Target number of buckets across any span; the router snaps to whatever nice
 /// ladder step comes closest to `span / TARGET_BUCKETS`, so a 1-hour and a
 /// 3-year window both come back at roughly this many points.
-const TARGET_BUCKETS: u64 = 500;
+const TARGET_BUCKETS: u64 = 1_000;
 
 /// Seconds in an hour and a day: the two `ideal`-band thresholds.
 const HOUR_SECS: u64 = 3_600;
 const DAY_SECS: u64 = 86_400;
 
 /// Sub-hour bucket ladder for the raw tier: `(width in seconds, SQL literal)`.
+/// A 1-2-5-10-15-30 rung per decade, so a zoom crosses a rung every ~2x rather
+/// than the old 5x jumps (`1s→5s`, `1m→5m`) that made the resolution feel static.
 const SUBHOUR_LADDER: &[(u64, &str)] = &[
     (1, "1 second"),
+    (2, "2 seconds"),
     (5, "5 seconds"),
     (10, "10 seconds"),
+    (15, "15 seconds"),
     (30, "30 seconds"),
     (60, "1 minute"),
+    (120, "2 minutes"),
     (300, "5 minutes"),
     (600, "10 minutes"),
     (900, "15 minutes"),
@@ -88,9 +94,12 @@ const HOUR_LADDER: &[(u64, &str)] = &[
 ];
 
 /// Whole-day bucket ladder for the `readings_1d` tier (capped at the top step).
+/// 3-day and 5-day rungs break up the old 2d→7d gap (a 3.5x jump).
 const DAY_LADDER: &[(u64, &str)] = &[
     (86_400, "1 day"),
     (2 * 86_400, "2 days"),
+    (3 * 86_400, "3 days"),
+    (5 * 86_400, "5 days"),
     (7 * 86_400, "7 days"),
     (14 * 86_400, "14 days"),
     (30 * 86_400, "30 days"),
@@ -108,10 +117,15 @@ pub struct SeriesRequest {
     /// The aggregation. `None` means "resolve from `series_meta.agg_mode`" at
     /// query time (gauge → avg, counter → delta).
     pub agg: Option<Agg>,
-    /// How empty buckets fill on the shared grid. `None` means no fill
-    /// (`Gapfill::None`): an empty bucket reads as 0. A series carries or ramps
-    /// across gaps only by opting into `locf`/`interpolate`.
+    /// How empty buckets fill on the shared grid. `None` defers to a default
+    /// resolved from `kind` and the (resolved) `agg` (see [`default_gapfill`]):
+    /// a bar or a `delta`/`integral` accumulation reads an empty bucket as 0,
+    /// a gauge line carries the last level. An explicit `locf`/`interpolate`/
+    /// `none` overrides that default.
     pub gapfill: Option<Gapfill>,
+    /// The chart type, used only to resolve the gapfill default (a bar's empty
+    /// buckets zero-fill, a line's carry forward). Never enters the SQL.
+    pub kind: SeriesType,
     /// Inclusive start of the window.
     pub from: SystemTime,
     /// Exclusive end of the window.
@@ -170,9 +184,11 @@ impl Tier {
 }
 
 /// Whether an aggregation can only be computed from raw per-point data. The
-/// caggs carry `(n, s, vmin, vmax, last_val, tw)` — no counter partial (V6
-/// dropped it) and nothing a percentile can be composed from — so `delta` and
-/// `median` always read raw.
+/// caggs carry `(n, s, vmin, vmax, last_val, tw)`: `delta` is last-minus-first
+/// but there is no `first_val` to pair with the stored `last_val`, and a
+/// percentile can't be composed from bucket rollups at all — so `delta` and
+/// `median` always read raw. (Adding `first_val` to the caggs would let `delta`
+/// roll up as `last(last_val) - first(first_val)`; deferred.)
 fn is_raw_only(agg: Agg) -> bool {
     matches!(agg, Agg::Delta | Agg::Median)
 }
@@ -217,9 +233,15 @@ fn value_expr(agg: Agg, tier: Tier) -> &'static str {
             Agg::Min => "min(value)",
             Agg::Last => "last(value, ts)",
             Agg::Median => "percentile_cont(0.5) WITHIN GROUP (ORDER BY value)",
-            // toolkit: delta() finalizes a counter_agg partial (handles resets);
-            // signature per timescaledb_toolkit 1.23.0, verify live.
-            Agg::Delta => "delta(counter_agg(ts, value))",
+            // Net change over the bucket: last value minus first. Deliberately
+            // NOT delta(counter_agg(...)): a counter that dithers in its last
+            // float ULP (or takes the odd sub-unit backward correction) trips
+            // counter_agg's reset detection, which reads each dip as a wrap and
+            // adds a full-counter jump -- turning a few-unit delta into millions.
+            // last-first ignores intra-bucket wobble; it only misreads a genuine
+            // mid-bucket reset, which a lifetime meter total effectively never
+            // does. first()/last() per timescaledb_toolkit 1.23.0, verify live.
+            Agg::Delta => "last(value, ts) - first(value, ts)",
             // toolkit: integral() finalizes a time_weight('LOCF') partial; its
             // default unit is value·seconds (leave unit scaling to the config's
             // scale). One-arg form on purpose. Signature per toolkit 1.23.0,
@@ -366,6 +388,23 @@ fn agg_from_mode(mode: Option<&str>) -> Agg {
     }
 }
 
+/// The gapfill to use when a series names none explicitly. `delta`/`integral`
+/// are accumulations: an empty bucket is a genuine zero (no flow, no counter
+/// change), so they never carry. The gauge aggregations straddle two cases the
+/// chart type tells apart — a bar is a quantity that reads 0 when absent, a line
+/// is a level that holds between samples. So a line carries the last level
+/// (`locf`); zoomed in past the on-change log cadence it stays a curve instead
+/// of picket-fencing down to 0 on every empty bucket.
+fn default_gapfill(agg: Agg, kind: SeriesType) -> Gapfill {
+    match agg {
+        Agg::Delta | Agg::Integral => Gapfill::None,
+        _ => match kind {
+            SeriesType::Bar => Gapfill::None,
+            SeriesType::Line => Gapfill::Locf,
+        },
+    }
+}
+
 /// Resolve the aggregation (if absent) and the unit from `series_meta`, build the
 /// tier-routed SQL, run it, and map rows to points. Gapfill emits one row per
 /// bucket; an empty bucket's NULL coalesces to 0, so every series comes back on
@@ -376,7 +415,9 @@ pub async fn query_series(pool: &Pool, req: &SeriesRequest) -> Result<SeriesResu
     let agg = req
         .agg
         .unwrap_or_else(|| agg_from_mode(meta.agg_mode.as_deref()));
-    let gapfill = req.gapfill.unwrap_or(Gapfill::None);
+    let gapfill = req
+        .gapfill
+        .unwrap_or_else(|| default_gapfill(agg, req.kind));
     let sql = build_sql(agg, gapfill, req.from, req.to, req.bucket);
     let rows = client
         .query(&sql, &[&req.uuid, &req.from, &req.to])
@@ -421,13 +462,13 @@ mod tests {
         )
     }
 
-    // --- one query per agg class on the raw tier (a 1-hour span → 10s) ---
+    // --- one query per agg class on the raw tier (a 1-hour span → 5s) ---
 
     #[test]
     fn avg_on_raw_is_a_plain_mean() {
         assert_eq!(
             sql_for_span(Agg::Avg, 3_600),
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, avg(value) AS value \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, avg(value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -436,17 +477,17 @@ mod tests {
     fn max_min_last_on_raw() {
         assert_eq!(
             sql_for_span(Agg::Max, 3_600),
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, max(value) AS value \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, max(value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
         assert_eq!(
             sql_for_span(Agg::Min, 3_600),
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, min(value) AS value \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, min(value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
         assert_eq!(
             sql_for_span(Agg::Last, 3_600),
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, last(value, ts) AS value \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, last(value, ts) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -455,7 +496,7 @@ mod tests {
     fn integral_on_raw_finalizes_a_time_weight_partial() {
         assert_eq!(
             sql_for_span(Agg::Integral, 3_600),
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
              integral(time_weight('LOCF', ts, value)) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -487,9 +528,9 @@ mod tests {
 
     #[test]
     fn mid_hour_band_snaps_up_the_hour_ladder() {
-        // 30 days: ideal = 5184 → 2 hours on readings_1h.
+        // 60 days: ideal = 5184 → 2 hours on readings_1h.
         assert_eq!(
-            sql_for_span(Agg::Max, 30 * DAY_SECS),
+            sql_for_span(Agg::Max, 60 * DAY_SECS),
             "SELECT time_bucket_gapfill('2 hours', bucket, $2::timestamptz, $3::timestamptz) AS bucket, max(vmax) AS value \
              FROM readings_1h WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -519,9 +560,9 @@ mod tests {
 
     #[test]
     fn integral_on_a_cagg_rolls_up_the_partial() {
-        // 30 days → hour tier; integral composes the stored tw partials.
+        // 60 days → hour tier; integral composes the stored tw partials.
         assert_eq!(
-            sql_for_span(Agg::Integral, 30 * DAY_SECS),
+            sql_for_span(Agg::Integral, 60 * DAY_SECS),
             "SELECT time_bucket_gapfill('2 hours', bucket, $2::timestamptz, $3::timestamptz) AS bucket, integral(rollup(tw)) AS value \
              FROM readings_1h WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -531,11 +572,11 @@ mod tests {
 
     #[test]
     fn delta_forces_raw_even_on_a_huge_span() {
-        // 1000 days would route to readings_1d (2-day buckets), but a counter
-        // delta must read raw; the 2-day width is kept.
+        // 1000 days would route to readings_1d (1-day buckets), but a counter
+        // delta must read raw; the 1-day width is kept.
         assert_eq!(
             sql_for_span(Agg::Delta, 1_000 * DAY_SECS),
-            "SELECT time_bucket_gapfill('2 days', ts, $2::timestamptz, $3::timestamptz) AS bucket, delta(counter_agg(ts, value)) AS value \
+            "SELECT time_bucket_gapfill('1 day', ts, $2::timestamptz, $3::timestamptz) AS bucket, last(value, ts) - first(value, ts) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -544,7 +585,7 @@ mod tests {
     fn median_forces_raw_even_on_a_huge_span() {
         assert_eq!(
             sql_for_span(Agg::Median, 1_000 * DAY_SECS),
-            "SELECT time_bucket_gapfill('2 days', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+            "SELECT time_bucket_gapfill('1 day', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
              percentile_cont(0.5) WITHIN GROUP (ORDER BY value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -583,7 +624,7 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT time_bucket_gapfill('1 month', ts, current_setting('TimeZone'), $2::timestamptz, $3::timestamptz) AS bucket, \
-             delta(counter_agg(ts, value)) AS value \
+             last(value, ts) - first(value, ts) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
     }
@@ -595,6 +636,26 @@ mod tests {
             sql_for_span(Agg::Avg, 100),
             "SELECT time_bucket_gapfill('1 second', ts, $2::timestamptz, $3::timestamptz) AS bucket, avg(value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
+        );
+    }
+
+    #[test]
+    fn densified_sub_hour_rung_snaps_to_two_seconds() {
+        // ideal = 2 lands on the 2-second rung added to break the old 1s→5s gap.
+        assert_eq!(
+            sql_for_span(Agg::Avg, 2 * TARGET_BUCKETS),
+            "SELECT time_bucket_gapfill('2 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, avg(value) AS value \
+             FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
+        );
+    }
+
+    #[test]
+    fn densified_day_rung_snaps_to_three_days() {
+        // ideal = 3 days lands on the 3-day rung added to break the old 2d→7d gap.
+        assert_eq!(
+            sql_for_span(Agg::Avg, 3 * DAY_SECS * TARGET_BUCKETS),
+            "SELECT time_bucket_gapfill('3 days', bucket, $2::timestamptz, $3::timestamptz) AS bucket, sum(s) / NULLIF(sum(n), 0) AS value \
+             FROM readings_1d WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1 ORDER BY 1"
         );
     }
 
@@ -614,7 +675,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
              locf(avg(value)) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -633,7 +694,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
              interpolate(avg(value)) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
@@ -652,10 +713,40 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT time_bucket_gapfill('10 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
              avg(value) AS value \
              FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
         );
+    }
+
+    // --- the absent-gapfill default: keyed on chart type, agg pins the flows ---
+
+    #[test]
+    fn gauge_line_defaults_to_locf() {
+        // A held level drawn as a line carries across empty buckets, so zooming
+        // in past the log cadence stays a curve instead of picket-fencing to 0.
+        for agg in [Agg::Avg, Agg::Median, Agg::Min, Agg::Max, Agg::Last] {
+            assert_eq!(default_gapfill(agg, SeriesType::Line), Gapfill::Locf);
+        }
+    }
+
+    #[test]
+    fn gauge_bar_defaults_to_none() {
+        // A quantity drawn as bars reads 0 when absent (an on-change meter quiet
+        // at zero), so an empty bucket must stay 0, not carry the last level.
+        for agg in [Agg::Avg, Agg::Median, Agg::Min, Agg::Max, Agg::Last] {
+            assert_eq!(default_gapfill(agg, SeriesType::Bar), Gapfill::None);
+        }
+    }
+
+    #[test]
+    fn accumulations_default_to_none_regardless_of_type() {
+        // delta/integral have a genuine zero in an empty bucket; the type never
+        // overrides that, so a counter charted as a line still reads 0, not locf.
+        for agg in [Agg::Delta, Agg::Integral] {
+            assert_eq!(default_gapfill(agg, SeriesType::Line), Gapfill::None);
+            assert_eq!(default_gapfill(agg, SeriesType::Bar), Gapfill::None);
+        }
     }
 
     #[test]
@@ -716,6 +807,7 @@ mod tests {
                 sub: "value".to_owned(),
                 agg: Some(agg),
                 gapfill: None,
+                kind: SeriesType::Line,
                 from,
                 to,
                 bucket: None,

@@ -418,16 +418,54 @@
 
   // The wheel/slider zoom lives inside the loaded data, so a panel fetches and
   // pins its x-axis to a window PADDED by this fraction of the span on each
-  // side, while the dataZoom shows only the inner [from,to]. That inset gives a
-  // scroll-out room to reveal loaded margin before it triggers a requery,
-  // instead of dead-ending at the data edge; and since the inner window is set
-  // by absolute value, the visible range holds steady across the redraw (see
-  // buildPanelOption and onZoom).
+  // side, while the dataZoom shows only the inner [from,to]. That inset gives
+  // scroll-out room to reveal loaded margin instead of dead-ending at the data
+  // edge; and a settled zoom that stays within the margin AND keeps the same
+  // bucket rung skips the requery entirely (see zoomRestingInLoaded), so a burst
+  // of wheel notches no longer refetches identical data every notch. Since the
+  // inner window is set by absolute value, the visible range holds steady across
+  // a redraw (see buildPanelOption and onZoom).
   var ZOOM_PAD = 0.5;
 
   function padWindow(win) {
     var pad = (win.to - win.from) * ZOOM_PAD;
     return { from: Math.round(win.from - pad), to: Math.round(win.to + pad) };
+  }
+
+  // A client-side mirror of the server tier router (query.rs route/snap): map a
+  // window span to the bucket-width rung it resolves to, as a stable key. The
+  // server stays authoritative for the query; the client uses this ONLY to tell
+  // whether a settled zoom would change the resolution, so an in-pad zoom that
+  // keeps the same rung can skip the requery (see zoomRestingInLoaded). Keep the
+  // ladders and TARGET_BUCKETS in sync with query.rs. Rungs don't overlap across
+  // tiers, so the width in seconds is itself a unique key.
+  var TARGET_BUCKETS = 1000;
+  var HOUR_SECS = 3600;
+  var DAY_SECS = 86400;
+  var SUBHOUR_LADDER = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800];
+  var HOUR_LADDER = [3600, 7200, 10800, 14400, 21600, 28800, 43200];
+  var DAY_LADDER = [86400, 172800, 259200, 432000, 604800, 1209600, 2592000];
+
+  function snapLadder(ladder, ideal) {
+    for (var i = 0; i < ladder.length; i += 1) {
+      if (ladder[i] >= ideal) {
+        return ladder[i];
+      }
+    }
+    return ladder[ladder.length - 1];
+  }
+
+  // Span in ms -> resolved bucket width in seconds. Mirrors the server's integer
+  // math: span_secs = floor(ms/1000), ideal = floor(span_secs / TARGET_BUCKETS).
+  function bucketWidth(spanMs) {
+    var ideal = Math.floor(Math.floor(spanMs / 1000) / TARGET_BUCKETS);
+    if (ideal < HOUR_SECS) {
+      return snapLadder(SUBHOUR_LADDER, ideal);
+    }
+    if (ideal < DAY_SECS) {
+      return snapLadder(HOUR_LADDER, ideal);
+    }
+    return snapLadder(DAY_LADDER, ideal);
   }
 
   function readUrl() {
@@ -520,7 +558,7 @@
 
   var INTERP = { linear: {}, smooth: { smooth: true }, step: { step: "end" } };
 
-  function buildPanelOption(panel, seriesData, viewWin, padWin, dbUnits, animate) {
+  function buildPanelOption(panel, seriesData, viewWin, padWin, dbUnits) {
     var theme = themeName();
     var chrome = CHROME[theme];
     var palette = PALETTE[theme];
@@ -546,7 +584,9 @@
       var cfgUnit = (panel.axes && panel.axes[yIdx] && panel.axes[yIdx].unit) || "";
       var dbUnit = (dbUnits && dbUnits[i]) || "";
       seriesUnits[i] = cfgUnit || dbUnit;
-      if (dbUnit && axisStoreUnit[yIdx] === undefined) {
+      // A hidden series is never drawn, so its unit must not become an axis's
+      // fallback label (a hidden kWh counter would mislabel a kW/°C axis).
+      if (dbUnit && !s.hidden && axisStoreUnit[yIdx] === undefined) {
         axisStoreUnit[yIdx] = dbUnit;
       }
     });
@@ -584,9 +624,22 @@
     }
 
     var legend = [];
-    var series = panel.series.map(function (s, i) {
+    // drawnUnits parallels the ECharts series array (hidden series omitted), so
+    // the tooltip can index it by seriesIndex; seriesUnits is keyed by the full
+    // panel.series index and would drift once a hidden series is skipped.
+    var drawnUnits = [];
+    var series = [];
+    panel.series.forEach(function (s, i) {
+      // A hidden series is computed for expr references (buildPanelSeriesData
+      // still registers its data by id) but never drawn: no legend, no chart
+      // series. Skipping it here is what keeps drawnUnits aligned with the
+      // ECharts series index.
+      if (s.hidden) {
+        return;
+      }
       var label = s.label || s.id || "series " + (i + 1);
       legend.push(label);
+      drawnUnits.push(seriesUnits[i]);
       var color = s.color || palette[i % palette.length];
       var yIdx = seriesAxis[i];
       var opt = {
@@ -627,14 +680,14 @@
         opt.barCategoryGap = "10%";
         opt.barGap = "10%";
       }
-      return opt;
+      series.push(opt);
     });
 
     return {
-      // Animate the first paint, but snap data updates (zoom requery, refresh)
-      // instantly -- a transition there just slides the graph around before it
+      // Never animate: an initial line-draw is just slow, and on data updates
+      // (zoom requery, refresh) a transition slides the graph around before it
       // settles on the new window.
-      animation: animate,
+      animation: false,
       backgroundColor: "transparent",
       textStyle: { color: chrome.ink2, fontFamily: "system-ui, -apple-system, sans-serif" },
       grid: { left: 56, right: 56, top: 36, bottom: 44, containLabel: true },
@@ -661,7 +714,7 @@
               text = "-";
             } else {
               text = typeof v === "number" ? String(Number(v.toFixed(3))) : String(v);
-              var unit = seriesUnits[p.seriesIndex];
+              var unit = drawnUnits[p.seriesIndex];
               if (unit) {
                 text += " " + unit;
               }
@@ -780,14 +833,15 @@
           return r ? r.unit : null;
         });
         var seriesData = buildPanelSeriesData(panel.series, boundPoints);
-        var animate = !chart.__painted;
-        chart.__painted = true;
         // Remember the extent we pinned the axis to, so onZoom can resolve a
         // zoom's percentages against the window actually on screen (a burst of
-        // ticks all map against this, not against the drifting state.range).
+        // ticks all map against this, not against the drifting state.range), and
+        // the rung this data was fetched at, so a later zoom can tell whether a
+        // requery would change the resolution (see zoomRestingInLoaded).
         chart.__padWin = padWin;
+        chart.__loadedKey = bucketWidth(padWin.to - padWin.from);
         suppressZoom = true;
-        chart.setOption(buildPanelOption(panel, seriesData, win, padWin, dbUnits, animate), {
+        chart.setOption(buildPanelOption(panel, seriesData, win, padWin, dbUnits), {
           notMerge: true,
         });
         setTimeout(function () {
@@ -867,8 +921,35 @@
     }
     zoomTimer = setTimeout(function () {
       zoomTimer = null;
+      if (zoomRestingInLoaded()) {
+        return; // resolution unchanged and the view sits in loaded margin;
+        // ECharts already drew the client-side zoom, so a requery is a no-op.
+      }
       reloadAllPanels();
     }, 280);
+  }
+
+  // Whether a settled zoom needs no requery: every chart's new window still
+  // sits inside the padded extent its data was loaded at, AND that data was
+  // fetched at the same bucket rung this window would resolve to. Then the
+  // loaded series already cover the view at the right density and ECharts has
+  // rendered the client-side zoom. Conservative -- a chart that hasn't loaded
+  // (no __padWin) forces a reload rather than risk showing stale resolution.
+  function zoomRestingInLoaded() {
+    if (!charts.length) {
+      return false;
+    }
+    var win = resolveWindow();
+    var pad = padWindow(win);
+    var key = bucketWidth(pad.to - pad.from);
+    return charts.every(function (c) {
+      return (
+        c.__padWin &&
+        c.__loadedKey === key &&
+        win.from >= c.__padWin.from &&
+        win.to <= c.__padWin.to
+      );
+    });
   }
 
   // Refetch every panel of the current view against the current window, with a

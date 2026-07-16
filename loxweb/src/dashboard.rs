@@ -124,6 +124,12 @@ pub struct Series {
     /// Fill the area under a line.
     #[serde(default)]
     pub fill: bool,
+    /// Computed for `expr` references but never drawn — no legend entry, no
+    /// plotted line/bars. For a bound input a derived sibling needs that has no
+    /// place on the panel itself (a raw counter feeding a ratio, say). Requires
+    /// an `id`, since a hidden series is pointless unless something references it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
     /// Stack group; series sharing a group stack together.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack: Option<String>,
@@ -145,8 +151,9 @@ pub struct Series {
     pub agg: Option<Agg>,
     /// Bound series: how an empty bucket is filled on the shared query grid —
     /// carry the last value (`locf`), linearly `interpolate`, or leave it empty
-    /// (`none`, read as 0). Absent defaults to `none`; a signal that should carry
-    /// or ramp across gaps (a temperature, a level) opts into `locf`/`interpolate`.
+    /// (`none`, read as 0). Absent resolves a default from the chart type and
+    /// aggregation (a gauge line carries, a bar or a delta/integral accumulation
+    /// reads 0); set this to override, e.g. `interpolate` for a smooth signal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gapfill: Option<Gapfill>,
     /// Derived series: an arithmetic expression over sibling series ids.
@@ -224,8 +231,9 @@ pub enum Agg {
 
 /// How an empty bucket gets a value on the shared query grid. Every bound series
 /// is bucketed onto the same dense grid so a panel's stack lines up index-for-
-/// index; this picks what fills the empties. Absent on a series defaults to
-/// `None` (no fill); `locf`/`interpolate` are explicit opt-ins.
+/// index; this picks what fills the empties. Absent on a series resolves a
+/// default from the chart type and aggregation (see [`Series::gapfill`]);
+/// `locf`/`interpolate`/`none` set here are explicit overrides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Gapfill {
@@ -236,8 +244,9 @@ pub enum Gapfill {
     /// Linearly interpolate between the surrounding points (a first-order hold);
     /// for a smoothly-varying, coarsely-sampled signal like a forecast.
     Interpolate,
-    /// No fill (the default): an empty bucket stays empty and reads as 0. Right
-    /// for an accumulation, or an on-change meter that goes quiet at zero.
+    /// No fill: an empty bucket stays empty and reads as 0. Right for an
+    /// accumulation, or an on-change meter that goes quiet at zero — the resolved
+    /// default for a bar and for delta/integral.
     None,
 }
 
@@ -302,6 +311,13 @@ fn validate_panel(view: &View, panel: &Panel) -> anyhow::Result<()> {
                 }
             }
             (true, false) => {}
+        }
+
+        if series.hidden && series.id.is_none() {
+            bail!(
+                "{}: {sref} is hidden but has no id; a hidden series is only useful if a sibling expr references it",
+                loc(view, panel)
+            );
         }
 
         if let Some(id) = &series.id
@@ -868,6 +884,43 @@ views:
         let err = DashboardStore::parse_and_validate(yaml).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("neither uuid nor expr"), "message was: {msg}");
+    }
+
+    #[test]
+    fn parses_a_hidden_input_series() {
+        // A hidden bound counter feeds a derived sibling but is not drawn; the
+        // derived series that references it is visible as usual.
+        let yaml = r#"
+views:
+  - id: v
+    title: V
+    panels:
+      - title: P
+        series:
+          - {id: a, uuid: "deadbeef-0000-0000-0000-000000000001", agg: delta, hidden: true}
+          - {label: R, expr: "a / 2"}
+"#;
+        let dbs = DashboardStore::parse_and_validate(yaml).unwrap();
+        assert!(dbs.views[0].panels[0].series[0].hidden);
+        assert!(!dbs.views[0].panels[0].series[1].hidden);
+    }
+
+    #[test]
+    fn rejects_a_hidden_series_without_id() {
+        // Hidden and unreferenceable is a dead series; reject it so the mistake
+        // surfaces at load rather than silently drawing nothing.
+        let yaml = r#"
+views:
+  - id: v
+    title: V
+    panels:
+      - title: P
+        series:
+          - {uuid: "deadbeef-0000-0000-0000-000000000001", hidden: true}
+"#;
+        let err = DashboardStore::parse_and_validate(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("hidden but has no id"), "message was: {msg}");
     }
 
     #[test]
