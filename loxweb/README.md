@@ -58,7 +58,6 @@ views:
 | Key | Meaning |
 |-----|---------|
 | `uuid` | Bound series: the store series to read (a `series_meta.uuid`). |
-| `sub` | The sub-channel; defaults to `value`. Documentary — the uuid identifies the series. |
 | `agg` | `avg` \| `max` \| `min` \| `median` \| `last` (plain), or `delta` \| `integral` (counter / time-weighted). Absent resolves from the series' stored kind. |
 | `expr` | Derived series: `+ - * /`, parens, constants, and sibling series `id`s. Evaluated in declaration order, so a derived series may reference an earlier one. |
 | `type` | `line` (default) or `bar`; may be mixed in one panel. |

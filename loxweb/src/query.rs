@@ -117,10 +117,6 @@ const DAY_LADDER: &[(u64, &str)] = &[
 pub struct SeriesRequest {
     /// The stable state uuid — the one thing that keys a series in the store.
     pub uuid: Uuid,
-    /// The sub-channel, carried for provenance/logging only. `readings` keys on
-    /// uuid alone (there is no `sub` column), so this never enters a WHERE
-    /// clause; the uuid already pins the exact series.
-    pub sub: String,
     /// The aggregation. `None` means "resolve from `series_meta.agg_mode`" at
     /// query time (gauge → avg, counter → delta).
     pub agg: Option<Agg>,
@@ -974,7 +970,6 @@ mod tests {
         for agg in [Agg::Avg, Agg::Integral] {
             let req = SeriesRequest {
                 uuid,
-                sub: "value".to_owned(),
                 agg: Some(agg),
                 gapfill: None,
                 kind: SeriesType::Line,

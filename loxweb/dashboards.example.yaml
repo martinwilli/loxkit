@@ -100,7 +100,6 @@ views:
           - id: prod
             label: Production
             uuid: deadbeef-0000-0000-0000-000000000006
-            sub: prodCurrDay
             agg: max
             type: bar
             stack: flow
@@ -108,7 +107,6 @@ views:
           - id: grid_in
             label: Grid Import
             uuid: deadbeef-0000-0000-0000-000000000007
-            sub: consCurrDay
             agg: max
             type: bar
             stack: flow
@@ -116,7 +114,6 @@ views:
           - id: cons
             label: Consumption
             uuid: deadbeef-0000-0000-0000-000000000008
-            sub: consTotal
             agg: max
             type: bar
             stack: flow
@@ -151,7 +148,6 @@ views:
           - id: import_kwh
             label: Import
             uuid: deadbeef-0000-0000-0000-000000000009
-            sub: total
             agg: delta
             type: bar
             stack: e
@@ -160,7 +156,6 @@ views:
           - id: export_kwh
             label: Export
             uuid: deadbeef-0000-0000-0000-00000000000a
-            sub: total
             agg: delta
             type: bar
             stack: e
@@ -186,7 +181,6 @@ views:
         series:
           - label: Meter
             uuid: deadbeef-0000-0000-0000-00000000000c
-            sub: total
             agg: delta
             type: bar
             axis: kwh2

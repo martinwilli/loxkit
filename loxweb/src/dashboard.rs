@@ -2,7 +2,7 @@
 //!
 //! A dashboard is a list of *views*; a view is a list of *panels*; a panel is
 //! `axes[] + series[]`. Every series is either **bound** (a `uuid` plus an
-//! optional `sub`/`agg`, read straight from the store) or **derived** (an
+//! optional `agg`, read straight from the store) or **derived** (an
 //! `expr` computed from its sibling series). Presentation keys are all optional
 //! and appear only when they carry meaning, so the common series is one line.
 //!
@@ -26,11 +26,6 @@ use anyhow::{Context as _, bail};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tracing::{error, info};
-
-/// loxtap's default sub-channel: a control's primary state carries no sub-name
-/// of its own, so a bound series that omits `sub` resolves to this. Mirrors the
-/// daemon's structure resolution (a plain `value` state).
-pub const DEFAULT_SUB: &str = "value";
 
 /// The whole dashboard set — the parsed contents of `dashboards.yaml`.
 ///
@@ -151,13 +146,10 @@ pub struct Series {
     #[serde(default = "default_scale")]
     pub scale: f64,
 
-    // --- binding: exactly one of {uuid (+sub,+agg)} or {expr} ---
+    // --- binding: exactly one of {uuid (+agg)} or {expr} ---
     /// Bound series: the store uuid to read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
-    /// Bound series: the sub-channel; omitted resolves to [`DEFAULT_SUB`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sub: Option<String>,
     /// Bound series: the aggregation. Absent is resolved later from
     /// `series_meta.agg_mode` (commit 3), so no default is imposed here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,15 +164,6 @@ pub struct Series {
     /// Derived series: an arithmetic expression over sibling series ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expr: Option<String>,
-}
-
-impl Series {
-    /// The sub-channel this bound series reads, applying loxtap's `value`
-    /// default when a control names no sub explicitly. Meaningless for a
-    /// derived series (which has no uuid); callers gate on the binding.
-    pub fn resolved_sub(&self) -> &str {
-        self.sub.as_deref().unwrap_or(DEFAULT_SUB)
-    }
 }
 
 /// A fixed calendar bucket, the scalar shorthand of a [`BucketSpec`]: `day` and
@@ -583,9 +566,9 @@ fn validate_panel(view: &View, panel: &Panel) -> anyhow::Result<()> {
                 loc(view, panel)
             ),
             (false, true) => {
-                if series.sub.is_some() || series.agg.is_some() || series.gapfill.is_some() {
+                if series.agg.is_some() || series.gapfill.is_some() {
                     bail!(
-                        "{}: derived {sref} must not carry sub/agg/gapfill (those apply only to a bound uuid series)",
+                        "{}: derived {sref} must not carry agg/gapfill (those apply only to a bound uuid series)",
                         loc(view, panel)
                     );
                 }
@@ -988,14 +971,14 @@ views:
           - {id: energy, side: left, unit: kWh}
           - {id: ratio, side: right, min: 0, max: 6}
         series:
-          - {id: heat,  label: Heat,  uuid: "deadbeef-0000-0000-0000-000000000001", sub: total, agg: delta, type: bar, axis: energy}
-          - {id: power, label: Power, uuid: "deadbeef-0000-0000-0000-000000000002", sub: total, agg: delta, type: bar, axis: energy}
+          - {id: heat,  label: Heat,  uuid: "deadbeef-0000-0000-0000-000000000001", agg: delta, type: bar, axis: energy}
+          - {id: power, label: Power, uuid: "deadbeef-0000-0000-0000-000000000002", agg: delta, type: bar, axis: energy}
           - {label: Temperature, uuid: "deadbeef-0000-0000-0000-000000000003", agg: avg, type: line, axis: ratio, color: "#4a7fb5"}
           - {label: COP, expr: "heat / power", type: line, axis: ratio, interp: smooth}
       - title: Live
         series:
-          - {id: prod, label: Production,  uuid: "deadbeef-0000-0000-0000-000000000004", sub: prodCurrDay, agg: max, type: bar, stack: gen, stack_strategy: all}
-          - {id: cons, label: Consumption, uuid: "deadbeef-0000-0000-0000-000000000005", sub: consCurrDay, agg: max, type: bar, stack: use, scale: -1}
+          - {id: prod, label: Production,  uuid: "deadbeef-0000-0000-0000-000000000004", agg: max, type: bar, stack: gen, stack_strategy: all}
+          - {id: cons, label: Consumption, uuid: "deadbeef-0000-0000-0000-000000000005", agg: max, type: bar, stack: use, scale: -1}
           - {label: Net, expr: "prod + cons", type: line, interp: smooth}
   - id: yearly
     title: Yearly
@@ -1031,14 +1014,12 @@ views:
         assert_eq!(heat.kind, SeriesType::Bar);
         assert_eq!(heat.agg, Some(Agg::Delta));
         assert_eq!(heat.axis.as_deref(), Some("energy"));
-        assert_eq!(heat.resolved_sub(), "total");
         assert_eq!(heat.scale, 1.0);
         assert_eq!(heat.interp, Interp::Linear);
         assert_eq!(heat.stack_strategy, StackStrategy::Samesign);
 
-        // sub omitted -> DEFAULT_SUB; agg deferred as None.
+        // agg deferred as None.
         let temp = &heating.series[2];
-        assert_eq!(temp.resolved_sub(), "value");
         assert_eq!(temp.color.as_deref(), Some("#4a7fb5"));
 
         // A derived series referencing two siblings.
@@ -1310,7 +1291,7 @@ views:
     #[test]
     fn rejects_a_derived_series_carrying_gapfill() {
         // gapfill applies to a bound uuid query; a derived series is computed
-        // client-side and must not carry it (same rule as sub/agg).
+        // client-side and must not carry it (same rule as agg).
         let yaml = r#"
 views:
   - id: v
@@ -1323,7 +1304,7 @@ views:
 "#;
         let err = DashboardStore::parse_and_validate(yaml).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("must not carry sub/agg/gapfill"), "message was: {msg}");
+        assert!(msg.contains("must not carry agg/gapfill"), "message was: {msg}");
     }
 
     #[test]

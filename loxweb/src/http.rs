@@ -264,9 +264,9 @@ fn view_bound_uuids(dash: &Dashboards, view: &str) -> Result<Vec<Uuid>, ApiError
 /// Pure and DB-free (unit-tested offline): an unknown view/panel/series is a 404;
 /// a derived series (an `expr`, no `uuid`) is a 400 because the client evaluates
 /// those locally and must not query the store for them; a malformed `uuid` string
-/// is a 400. The `sub` comes from [`Series::resolved_sub`](crate::dashboard::Series::resolved_sub),
-/// the `agg` from the series, and the calendar bucket from the panel falling back
-/// to the view. The optional `vis` carries the visible `(from, to)` window whose
+/// is a 400. The `agg` comes from the series, and the calendar bucket from the
+/// panel falling back to the view. The optional `vis` carries the visible
+/// `(from, to)` window whose
 /// span drives the bucket width; absent, it defaults to the scanned `[from, to]`.
 fn resolve_request(
     dash: &Dashboards,
@@ -305,7 +305,6 @@ fn resolve_request(
 
     Ok(SeriesRequest {
         uuid,
-        sub: series_ref.resolved_sub().to_owned(),
         agg: series_ref.agg,
         gapfill: series_ref.gapfill,
         kind: series_ref.kind,
@@ -377,7 +376,7 @@ views:
     panels:
       - title: P0
         series:
-          - {id: a, label: A, uuid: "deadbeef-0000-0000-0000-000000000001", sub: total, agg: avg}
+          - {id: a, label: A, uuid: "deadbeef-0000-0000-0000-000000000001", agg: avg}
           - {id: d, label: D, expr: "a + 1"}
   - id: yearly
     title: Yearly View
@@ -525,7 +524,6 @@ views:
             req.uuid,
             Uuid::parse_str("deadbeef-0000-0000-0000-000000000001").unwrap()
         );
-        assert_eq!(req.sub, "total");
         assert_eq!(req.agg, Some(Agg::Avg));
         assert_eq!(req.bucket, None);
         assert_eq!(req.from, UNIX_EPOCH + Duration::from_millis(1_000));
@@ -548,14 +546,12 @@ views:
     }
 
     #[test]
-    fn resolve_inherits_the_view_bucket_and_default_sub() {
+    fn resolve_inherits_the_view_bucket() {
         let dash = dashboards();
         // The yearly view carries bucket: month; its panel omits one, so the
         // request inherits it via panel.bucket.or(view.bucket).
         let req = resolve_request(&dash, "yearly", 0, 0, 0, 1, None).unwrap();
         assert_eq!(req.bucket, Some(BucketSpec::Fixed(Bucket::Month)));
-        // sub omitted on the series -> the default value channel.
-        assert_eq!(req.sub, "value");
         assert_eq!(req.agg, Some(Agg::Delta));
     }
 
