@@ -33,6 +33,7 @@ use tracing::{error, info};
 /// frontend as JSON. The `skip_serializing_if` on the optional fields keeps that
 /// JSON as terse as the YAML — an absent key stays absent, never `null`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Dashboards {
     /// The views, each a tab of panels.
     pub views: Vec<View>,
@@ -40,6 +41,7 @@ pub struct Dashboards {
 
 /// A view: one named tab of panels sharing a default time window.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct View {
     /// Stable id (used in URLs and API paths).
     pub id: String,
@@ -60,6 +62,7 @@ pub struct View {
 
 /// A panel: one chart, `axes[] + series[]`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Panel {
     /// Panel title.
     pub title: String,
@@ -80,6 +83,7 @@ pub struct Panel {
 
 /// A declared y-axis a series can be pinned to.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Axis {
     /// Axis id, referenced by `series.axis`.
     pub id: String,
@@ -105,6 +109,7 @@ pub struct Axis {
 
 /// A single series: either bound to a store uuid or derived from siblings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Series {
     /// Optional id, so a derived sibling can reference this series in an `expr`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -338,6 +343,7 @@ impl<'de> Deserialize<'de> for BucketInterval {
 /// One rule in a bucket schedule: for windows whose span is strictly less than
 /// `upto`, bucket at `every`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BucketRule {
     pub upto: BucketInterval,
     pub every: BucketInterval,
@@ -1337,6 +1343,22 @@ views:
         let err = DashboardStore::parse_and_validate(yaml).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("neither uuid nor expr"), "message was: {msg}");
+    }
+
+    #[test]
+    fn rejects_an_unknown_series_key() {
+        // A misspelled or obsolete key (here `colour` for `color`) must be a hard
+        // parse error, not a silently-dropped no-op that misleads the author.
+        let yaml = r#"
+views:
+  - id: v
+    title: V
+    panels:
+      - title: P
+        series:
+          - {label: A, uuid: "deadbeef-0000-0000-0000-000000000001", colour: red}
+"#;
+        assert!(DashboardStore::parse_and_validate(yaml).is_err());
     }
 
     #[test]
