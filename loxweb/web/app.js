@@ -416,6 +416,20 @@
     return w || parseRange(DEFAULT_RANGE, Date.now());
   }
 
+  // The wheel/slider zoom lives inside the loaded data, so a panel fetches and
+  // pins its x-axis to a window PADDED by this fraction of the span on each
+  // side, while the dataZoom shows only the inner [from,to]. That inset gives a
+  // scroll-out room to reveal loaded margin before it triggers a requery,
+  // instead of dead-ending at the data edge; and since the inner window is set
+  // by absolute value, the visible range holds steady across the redraw (see
+  // buildPanelOption and onZoom).
+  var ZOOM_PAD = 0.5;
+
+  function padWindow(win) {
+    var pad = (win.to - win.from) * ZOOM_PAD;
+    return { from: Math.round(win.from - pad), to: Math.round(win.to + pad) };
+  }
+
   function readUrl() {
     var params = new URLSearchParams(global.location.search);
     var view = params.get("view");
@@ -506,7 +520,7 @@
 
   var INTERP = { linear: {}, smooth: { smooth: true }, step: { step: "end" } };
 
-  function buildPanelOption(panel, seriesData, win, dbUnits) {
+  function buildPanelOption(panel, seriesData, viewWin, padWin, dbUnits, animate) {
     var theme = themeName();
     var chrome = CHROME[theme];
     var palette = PALETTE[theme];
@@ -577,7 +591,7 @@
       var yIdx = seriesAxis[i];
       var opt = {
         name: label,
-        type: s.kind === "bar" ? "bar" : "line",
+        type: s.type === "bar" ? "bar" : "line",
         yAxisIndex: yIdx,
         data: seriesData[i],
         color: color,
@@ -607,11 +621,20 @@
         if (s.stack) {
           opt.itemStyle.borderRadius = [2, 2, 0, 0];
         }
+        // Fatter bars: narrow the gap around each time band (default 20%) and,
+        // where several bar series share a band side by side, the gap between
+        // them (default 30%), so grouped bars read as blocks, not thin sticks.
+        opt.barCategoryGap = "10%";
+        opt.barGap = "10%";
       }
       return opt;
     });
 
     return {
+      // Animate the first paint, but snap data updates (zoom requery, refresh)
+      // instantly -- a transition there just slides the graph around before it
+      // settles on the new window.
+      animation: animate,
       backgroundColor: "transparent",
       textStyle: { color: chrome.ink2, fontFamily: "system-ui, -apple-system, sans-serif" },
       grid: { left: 56, right: 56, top: 36, bottom: 44, containLabel: true },
@@ -648,20 +671,21 @@
           return lines.join("<br/>");
         },
       },
-      // Pin the axis to the window so a dataZoom percentage maps back to an
-      // exact [from,to] on requery (see onZoom).
+      // Pin the axis to the padded window and show only the inner [from,to] via
+      // the dataZoom below, so a zoom-out has margin to reveal and a dataZoom
+      // value maps back to an exact [from,to] on requery (see onZoom).
       xAxis: {
         type: "time",
-        min: win.from,
-        max: win.to,
+        min: padWin.from,
+        max: padWin.to,
         axisLine: { lineStyle: { color: chrome.axis } },
         axisLabel: { color: chrome.muted },
         splitLine: { show: false },
       },
       yAxis: yAxis,
       dataZoom: [
-        { type: "inside", xAxisIndex: 0, filterMode: "none" },
-        { type: "slider", xAxisIndex: 0, filterMode: "none", height: 18, bottom: 8 },
+        { type: "inside", xAxisIndex: 0, filterMode: "none", startValue: viewWin.from, endValue: viewWin.to },
+        { type: "slider", xAxisIndex: 0, filterMode: "none", height: 18, bottom: 8, startValue: viewWin.from, endValue: viewWin.to },
       ],
       series: series,
     };
@@ -734,10 +758,12 @@
   function loadPanel(view, panel, panelIdx, chart, plot, win) {
     plot.classList.add("loading");
     var signal = inflight ? inflight.signal : undefined;
+    // Fetch the padded window; the dataZoom shows only the inner `win`.
+    var padWin = padWindow(win);
 
     var fetches = panel.series.map(function (s, seriesIdx) {
       if (s.uuid !== undefined && s.uuid !== null) {
-        return fetchSeries(view.id, panelIdx, seriesIdx, win, signal);
+        return fetchSeries(view.id, panelIdx, seriesIdx, padWin, signal);
       }
       return Promise.resolve(null); // derived: computed client-side
     });
@@ -754,8 +780,16 @@
           return r ? r.unit : null;
         });
         var seriesData = buildPanelSeriesData(panel.series, boundPoints);
+        var animate = !chart.__painted;
+        chart.__painted = true;
+        // Remember the extent we pinned the axis to, so onZoom can resolve a
+        // zoom's percentages against the window actually on screen (a burst of
+        // ticks all map against this, not against the drifting state.range).
+        chart.__padWin = padWin;
         suppressZoom = true;
-        chart.setOption(buildPanelOption(panel, seriesData, win, dbUnits), { notMerge: true });
+        chart.setOption(buildPanelOption(panel, seriesData, win, padWin, dbUnits, animate), {
+          notMerge: true,
+        });
         setTimeout(function () {
           suppressZoom = false;
         }, 0);
@@ -789,8 +823,8 @@
   // Section 9 -- interaction: drag-zoom -> tier-routed requery, and refresh.
   //
   // The zoom read is the interaction risk. On a datazoom event we map the
-  // reported window to an absolute [from,to] (preferring ECharts' value bounds,
-  // else the percentage against the pinned axis min/max), switch the global
+  // reported percentages against the chart's rendered axis extent to an absolute
+  // [from,to] (value bounds are the fallback), switch the global
   // range to that window, DEBOUNCE the burst (connected panels each fire an
   // event), cancel any in-flight fetches, and refetch every panel once. The
   // server tier-routes by span, so a narrower window transparently pulls a finer
@@ -803,17 +837,22 @@
     if (suppressZoom) {
       return;
     }
-    var win = resolveWindow();
-    var span = win.to - win.from;
+    // Map the reported zoom to an absolute [from,to]. Resolve the percentages
+    // against the chart's OWN rendered axis extent, which holds still through a
+    // burst of wheel ticks -- state.range moves on every tick but the axis is
+    // not requeried until the burst settles, so mapping against state.range
+    // would drift and the requery would overshoot the live zoom.
+    var axisWin = chart.__padWin || padWindow(resolveWindow());
+    var axisSpan = axisWin.to - axisWin.from;
     var z = e.batch && e.batch.length ? e.batch[0] : e;
     var from;
     var to;
-    if (isFinite(z.startValue) && isFinite(z.endValue)) {
+    if (isFinite(z.start) && isFinite(z.end)) {
+      from = Math.round(axisWin.from + (axisSpan * z.start) / 100);
+      to = Math.round(axisWin.from + (axisSpan * z.end) / 100);
+    } else if (isFinite(z.startValue) && isFinite(z.endValue)) {
       from = Math.round(z.startValue);
       to = Math.round(z.endValue);
-    } else if (isFinite(z.start) && isFinite(z.end)) {
-      from = Math.round(win.from + (span * z.start) / 100);
-      to = Math.round(win.from + (span * z.end) / 100);
     } else {
       return;
     }
