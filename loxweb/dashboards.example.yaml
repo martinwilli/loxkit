@@ -10,6 +10,12 @@
 # arithmetic `expr` over sibling series ids in the same panel, evaluated in the
 # browser in declaration order). Presentation keys appear only when they carry
 # meaning; everything else takes a sensible default.
+#
+# Every bound series is bucketed onto the same dense grid so a panel's stack
+# lines up. `gapfill` picks how an empty bucket fills, and defaults to `none`
+# (leave empty, read as 0). Set `locf` to carry the last value across a gap (a
+# level like a temperature or a valve position), or `interpolate` to ramp
+# between points (a coarsely sampled smooth signal).
 
 views:
   # A short live window, auto-refreshing. Panels mix bars and lines, pin series
@@ -28,7 +34,7 @@ views:
           - {id: ratio,    side: right}                 # unitless, third axis
         series:
           - {id: t_in,  label: Indoor Temp,  uuid: deadbeef-0000-0000-0000-000000000001, agg: avg, type: line, axis: temp, color: "#4a7fb5", interp: smooth, fill: true}
-          - {id: t_out, label: Outdoor Temp, uuid: deadbeef-0000-0000-0000-000000000002, agg: avg, type: line, axis: temp, color: orange}
+          - {id: t_out, label: Outdoor Temp, uuid: deadbeef-0000-0000-0000-000000000002, agg: avg, type: line, axis: temp, color: orange, gapfill: interpolate}
           - {label: Humidity, uuid: deadbeef-0000-0000-0000-000000000003, agg: avg, type: bar, axis: humidity, color: "#8bc34a"}
           - {label: In/Out Ratio, expr: "t_in / t_out", type: line, axis: ratio, interp: smooth}
 
@@ -36,7 +42,7 @@ views:
         axes:
           - {id: pct, side: left, unit: "%", min: 0, max: 100}
         series:
-          - {label: Valve Position, uuid: deadbeef-0000-0000-0000-000000000004, agg: last,   type: line, axis: pct, interp: step, color: "#e0663a"}
+          - {label: Valve Position, uuid: deadbeef-0000-0000-0000-000000000004, agg: last,   type: line, axis: pct, interp: step, gapfill: locf, color: "#e0663a"}
           - {label: Median Flow,    uuid: deadbeef-0000-0000-0000-000000000005, agg: median, type: line, axis: pct, color: "#7f8c8d"}
 
       - title: Power Flow         # stacking, a mirror below zero, chained derived

@@ -7,8 +7,9 @@
 //!   route).
 //! * `GET /api/series` takes `(view, panel, series, from, to)` — the frontend
 //!   addresses a series by its array index in the `/api/views` payload — resolves
-//!   it to a [`SeriesRequest`], and returns the tier-routed points as an
-//!   ECharts-native `[[t_ms, value], …]` array.
+//!   it to a [`SeriesRequest`], and returns `{unit, points}`: the store's unit
+//!   label (the display default) and the tier-routed points as an ECharts-native
+//!   `[[t_ms, value], …]` array.
 //! * `/`, `/app.js`, `/style.css`, `/echarts.min.js` are the SPA and the vendored
 //!   ECharts bundle, compiled into the binary with `include_str!` and served from
 //!   explicit routes — no runtime asset directory, so a bare `cargo run` and the
@@ -43,7 +44,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use deadpool_postgres::Pool;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::error;
 use uuid::Uuid;
@@ -148,20 +149,31 @@ struct SeriesQuery {
     to: i64,
 }
 
-/// `GET /api/series`: resolve the locator and return the tier-routed points as an
-/// ECharts-native `[[t_ms, value], …]` array. A resolve error maps to its status;
-/// a query error is logged and surfaces as a 500.
+/// The `GET /api/series` response: the store's unit label for the series (from
+/// `series_meta`, omitted when unset) plus the ECharts-native `[[t_ms, value], …]`
+/// points. The frontend uses `unit` as the display default, overridable by a
+/// config axis unit.
+#[derive(Debug, Serialize)]
+struct SeriesResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit: Option<String>,
+    points: Vec<(i64, f64)>,
+}
+
+/// `GET /api/series`: resolve the locator and return the series' unit plus the
+/// tier-routed points as an ECharts-native `[[t_ms, value], …]` array. A resolve
+/// error maps to its status; a query error is logged and surfaces as a 500.
 async fn get_series(
     State(state): State<AppState>,
     Query(q): Query<SeriesQuery>,
-) -> Result<Json<Vec<(i64, f64)>>, ApiError> {
+) -> Result<Json<SeriesResponse>, ApiError> {
     // Resolve against a snapshot, then drop it before the await so a concurrent
     // reload never blocks on this request.
     let req = {
         let dash = state.store.current();
         resolve_request(&dash, &q.view, q.panel, q.series, q.from, q.to)?
     };
-    let points = query::query_series(&state.pool, &req).await.map_err(|e| {
+    let result = query::query_series(&state.pool, &req).await.map_err(|e| {
         // `{e:#}` prints the whole anyhow context chain on one line; plain
         // Display stops at the top context and hides the real cause (the db
         // error), which is exactly what we need in the log.
@@ -169,11 +181,15 @@ async fn get_series(
         error!(error = %cause, uuid = %req.uuid, "series query failed");
         ApiError::Internal
     })?;
-    let data = points
+    let points = result
+        .points
         .iter()
         .map(|p| (systemtime_to_ms(p.t), p.v))
         .collect();
-    Ok(Json(data))
+    Ok(Json(SeriesResponse {
+        unit: result.unit,
+        points,
+    }))
 }
 
 /// Locate a series by `(view, panel, series)` and build its [`SeriesRequest`].
@@ -221,6 +237,7 @@ fn resolve_request(
         uuid,
         sub: series_ref.resolved_sub().to_owned(),
         agg: series_ref.agg,
+        gapfill: series_ref.gapfill,
         from: ms_to_systemtime(from_ms),
         to: ms_to_systemtime(to_ms),
         bucket: panel_ref.bucket.or(view.bucket),

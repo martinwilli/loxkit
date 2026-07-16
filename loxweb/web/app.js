@@ -506,24 +506,47 @@
 
   var INTERP = { linear: {}, smooth: { smooth: true }, step: { step: "end" } };
 
-  function buildPanelOption(panel, seriesData, win) {
+  function buildPanelOption(panel, seriesData, win, dbUnits) {
     var theme = themeName();
     var chrome = CHROME[theme];
     var palette = PALETTE[theme];
 
-    // y-axes: declared axes -> yAxis[]; none declared -> one implicit axis.
+    // axis id -> index, so a series can target one by id (unknown/none -> 0).
     var axisIndex = {};
+    if (panel.axes) {
+      panel.axes.forEach(function (ax, i) {
+        axisIndex[ax.id] = i;
+      });
+    }
+
+    // Per-series target axis and resolved unit. Unit precedence: the config
+    // axis unit (an explicit override) wins, else the store's series_meta.unit
+    // returned next to the points (dbUnits). Also remember the first store unit
+    // seen per axis, so an axis with no config unit still gets a label.
+    var seriesAxis = [];
+    var seriesUnits = [];
+    var axisStoreUnit = [];
+    panel.series.forEach(function (s, i) {
+      var yIdx = s.axis && axisIndex[s.axis] !== undefined ? axisIndex[s.axis] : 0;
+      seriesAxis[i] = yIdx;
+      var cfgUnit = (panel.axes && panel.axes[yIdx] && panel.axes[yIdx].unit) || "";
+      var dbUnit = (dbUnits && dbUnits[i]) || "";
+      seriesUnits[i] = cfgUnit || dbUnit;
+      if (dbUnit && axisStoreUnit[yIdx] === undefined) {
+        axisStoreUnit[yIdx] = dbUnit;
+      }
+    });
+
+    // y-axes: declared axes -> yAxis[]; none declared -> one implicit axis.
     var yAxis;
     if (panel.axes && panel.axes.length) {
       yAxis = panel.axes.map(function (ax, i) {
-        axisIndex[ax.id] = i;
         return {
           type: "value",
           position: ax.side || (i === 0 ? "left" : "right"),
-          // Axis label is the config unit; the series_meta.unit auto-default is
-          // not wired (the views JSON carries no unit), so an axis with no unit
-          // stays unlabeled.
-          name: ax.unit || "",
+          // Config unit is the override; else fall back to the store unit of a
+          // series on this axis, else leave it unlabeled.
+          name: ax.unit || axisStoreUnit[i] || "",
           min: ax.min !== undefined ? ax.min : null,
           max: ax.max !== undefined ? ax.max : null,
           nameTextStyle: { color: chrome.ink2 },
@@ -536,6 +559,8 @@
       yAxis = [
         {
           type: "value",
+          // The implicit axis borrows the store unit of its series.
+          name: axisStoreUnit[0] || "",
           nameTextStyle: { color: chrome.ink2 },
           axisLine: { lineStyle: { color: chrome.axis } },
           axisLabel: { color: chrome.muted },
@@ -549,7 +574,7 @@
       var label = s.label || s.id || "series " + (i + 1);
       legend.push(label);
       var color = s.color || palette[i % palette.length];
-      var yIdx = s.axis && axisIndex[s.axis] !== undefined ? axisIndex[s.axis] : 0;
+      var yIdx = seriesAxis[i];
       var opt = {
         name: label,
         type: s.kind === "bar" ? "bar" : "line",
@@ -599,6 +624,29 @@
       tooltip: {
         trigger: "axis",
         axisPointer: { type: "cross", link: [{ xAxisIndex: "all" }] },
+        // Round to 3 decimals (raw f64 values otherwise print ~15 digits) and
+        // append each series' unit (config axis unit, else the store default).
+        formatter: function (params) {
+          if (!params.length) {
+            return "";
+          }
+          var lines = [params[0].axisValueLabel];
+          params.forEach(function (p) {
+            var v = Array.isArray(p.value) ? p.value[1] : p.value;
+            var text;
+            if (v === null || v === undefined || (typeof v === "number" && isNaN(v))) {
+              text = "-";
+            } else {
+              text = typeof v === "number" ? String(Number(v.toFixed(3))) : String(v);
+              var unit = seriesUnits[p.seriesIndex];
+              if (unit) {
+                text += " " + unit;
+              }
+            }
+            lines.push(p.marker + p.seriesName + ": " + text);
+          });
+          return lines.join("<br/>");
+        },
       },
       // Pin the axis to the window so a dataZoom percentage maps back to an
       // exact [from,to] on requery (see onZoom).
@@ -695,10 +743,19 @@
     });
 
     Promise.all(fetches)
-      .then(function (boundPoints) {
+      .then(function (results) {
+        // Each bound fetch yields {unit, points}; a derived one is null. Split
+        // into the raw point arrays buildPanelSeriesData expects and the per-
+        // series store units the option builder defaults from.
+        var boundPoints = results.map(function (r) {
+          return r ? r.points : null;
+        });
+        var dbUnits = results.map(function (r) {
+          return r ? r.unit : null;
+        });
         var seriesData = buildPanelSeriesData(panel.series, boundPoints);
         suppressZoom = true;
-        chart.setOption(buildPanelOption(panel, seriesData, win), { notMerge: true });
+        chart.setOption(buildPanelOption(panel, seriesData, win, dbUnits), { notMerge: true });
         setTimeout(function () {
           suppressZoom = false;
         }, 0);
