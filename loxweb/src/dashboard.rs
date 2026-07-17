@@ -461,6 +461,9 @@ pub enum Agg {
     Last,
     /// Counter delta over the bucket.
     Delta,
+    /// Counter delta per unit time: the bucket delta divided by the bucket
+    /// duration, a rate (e.g. kW derived from a kWh counter).
+    Rate,
     /// Time-weighted integral over the bucket.
     Integral,
 }

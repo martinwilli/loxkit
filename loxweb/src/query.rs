@@ -71,6 +71,17 @@ const TARGET_BUCKETS: u64 = 1_000;
 const HOUR_SECS: u64 = 3_600;
 const DAY_SECS: u64 = 86_400;
 
+/// The `rate` aggregation differences the counter level over a window this wide
+/// (seconds), centered on each bucket, whenever the bucket is finer than it.
+/// Differencing a counter that ticks by a fixed quantum over a single fine
+/// bucket quantizes the rate to quantum * 3600 / bucket_secs per tick, so a
+/// bucket finer than the tick spacing resolves individual ticks and the rate
+/// steps between plateaus (visible teeth at high zoom). Averaging over a fixed
+/// span instead collapses those steps into a smooth curve; wider smooths more
+/// but blurs faster transitions, and ~4 minutes clears a fine counter's steps
+/// without visibly lagging a real edge.
+const RATE_WINDOW_SECS: u64 = 240;
+
 /// Sub-hour bucket ladder for the raw tier: `(width in seconds, SQL literal)`.
 /// A 1-2-5-10-15-30 rung per decade, so a zoom crosses a rung every ~2x rather
 /// than the old 5x jumps (`1s→5s`, `1m→5m`) that made the resolution feel static.
@@ -209,21 +220,23 @@ fn is_raw_only(agg: Agg) -> bool {
 }
 
 /// The first ladder step at least as wide as `ideal`, or the widest step when
-/// `ideal` outgrows the ladder (the top is a cap).
-fn snap(ladder: &[(u64, &'static str)], ideal: u64) -> &'static str {
-    for &(secs, lit) in ladder {
-        if secs >= ideal {
-            return lit;
+/// `ideal` outgrows the ladder (the top is a cap). Returns the whole rung
+/// `(width in seconds, SQL literal)`; the seconds feed the `rate` divisor.
+fn snap(ladder: &[(u64, &'static str)], ideal: u64) -> (u64, &'static str) {
+    for &rung in ladder {
+        if rung.0 >= ideal {
+            return rung;
         }
     }
-    ladder.last().expect("bucket ladders are non-empty").1
+    *ladder.last().expect("bucket ladders are non-empty")
 }
 
-/// Route a request by span to a `(tier, bucket-width literal)`. `delta`/`median`
-/// force the raw tier but keep the span-appropriate width.
-fn route(agg: Agg, span_secs: u64) -> (Tier, &'static str) {
+/// Route a request by span to a `(tier, bucket-width seconds, bucket-width
+/// literal)`. `delta`/`median` force the raw tier but keep the span-appropriate
+/// width; the seconds are the chosen interval's regardless of that override.
+fn route(agg: Agg, span_secs: u64) -> (Tier, u64, &'static str) {
     let ideal = span_secs / TARGET_BUCKETS;
-    let (natural_tier, interval) = if ideal < HOUR_SECS {
+    let (natural_tier, (secs, interval)) = if ideal < HOUR_SECS {
         (Tier::Raw, snap(SUBHOUR_LADDER, ideal))
     } else if ideal < DAY_SECS {
         (Tier::Hour, snap(HOUR_LADDER, ideal))
@@ -235,7 +248,7 @@ fn route(agg: Agg, span_secs: u64) -> (Tier, &'static str) {
     } else {
         natural_tier
     };
-    (tier, interval)
+    (tier, secs, interval)
 }
 
 /// The per-tier SQL value expression for an aggregation. The cagg branch never
@@ -257,6 +270,11 @@ fn value_expr(agg: Agg, tier: Tier) -> &'static str {
             // mid-bucket reset, which a lifetime meter total effectively never
             // does. first()/last() per timescaledb_toolkit 1.23.0, verify live.
             Agg::Delta => "last(value, ts) - first(value, ts)",
+            // Rate is a per-hour rate off the counter. build_sql interpolates
+            // this LEVEL (the bucket's last value) onto the gapfill grid and
+            // differences it across buckets, so a sparsely-logged counter still
+            // yields a smooth rate at any zoom.
+            Agg::Rate => "last(value, ts)",
             // toolkit: integral() finalizes a time_weight('LOCF') partial; its
             // default unit is value·seconds (leave unit scaling to the config's
             // scale). One-arg form on purpose. Signature per toolkit 1.23.0,
@@ -273,6 +291,9 @@ fn value_expr(agg: Agg, tier: Tier) -> &'static str {
             // the same last-minus-first as raw, so it ignores intra-bucket
             // float-ULP wobble identically (see the raw branch's reasoning).
             Agg::Delta => "last(last_val, bucket) - first(first_val, bucket)",
+            // Rate's level on the cagg is the bucket's last stored value;
+            // build_sql interpolates and differences it across buckets (see raw).
+            Agg::Rate => "last(last_val, bucket)",
             // toolkit: rollup() composes the stored tw partials, integral()
             // finalizes; identical result to the raw path. Signature per
             // toolkit 1.23.0, verify live.
@@ -300,7 +321,7 @@ fn build_sql(
     // panel stacks series index-for-index, so they must share the same bucket
     // set. Emitting only non-empty buckets (different per series) is what breaks
     // a stack, so gapfill densifies each series to the identical grid.
-    let (tier, bucket_expr) = if let Some(spec) = bucket {
+    let (tier, bucket_secs, bucket_expr) = if let Some(spec) = bucket {
         // A schedule/scalar bucket: resolve the width for this span, then let its
         // unit drive the source tier and clock-vs-calendar bucketing.
         let every = spec.resolve(span_secs);
@@ -331,14 +352,60 @@ fn build_sql(
             // Clock buckets (sub-day): the zone is irrelevant, plain 3-arg form.
             format!("time_bucket_gapfill('{literal}', {tcol}, $2::timestamptz, $3::timestamptz)")
         };
-        (tier, expr)
+        // span_secs() is exact for clock widths (what a rate ever uses); calendar
+        // widths are nominal (30d month, DST-ignorant day), fine for ordering.
+        (tier, every.span_secs(), expr)
     } else {
-        let (tier, interval) = route(agg, span_secs);
+        let (tier, secs, interval) = route(agg, span_secs);
         let tcol = tier.tcol();
         let expr =
             format!("time_bucket_gapfill('{interval}', {tcol}, $2::timestamptz, $3::timestamptz)");
-        (tier, expr)
+        (tier, secs, expr)
     };
+
+    let table = tier.table();
+    let tcol = tier.tcol();
+
+    // Rate is a per-hour rate off a counter. A within-bucket last-first collapses
+    // to 0 once the bucket is finer than the counter's log cadence (each bucket
+    // then holds fewer than two samples). So interpolate the cumulative LEVEL onto
+    // the gapfill grid and difference it: a sparse tick spreads over the buckets
+    // it spans, and 3600.0/dt turns a counter delta into a per-hour rate (kW from
+    // a kWh counter). The level's own gapfill is fixed (interpolate), so a
+    // series-level gapfill does not apply.
+    //
+    // A single-bucket difference still quantizes, though: a counter that ticks by
+    // a fixed quantum q reads q * 3600 / bucket_secs per tick, so a bucket finer
+    // than the tick spacing resolves individual ticks and the rate steps between
+    // q/dt plateaus (visible teeth at high zoom). So difference the level over a
+    // fixed RATE_WINDOW_SECS window centered on the bucket, dividing by the
+    // frame's ACTUAL span: that averages several ticks into a smooth curve while
+    // keeping the fine grid (points still align with the panel's other series),
+    // centered so there is no phase lag, and the frame simply narrows toward the
+    // window edges rather than reading a false 0. Coarse buckets (>= the window,
+    // and the caggs) already have a negligible quantum, so they keep the plain
+    // adjacent-bucket difference, whose leading bucket reads NULL (coalesced to 0
+    // in query_series, out in the padded left margin).
+    if matches!(agg, Agg::Rate) {
+        let level = value_expr(agg, tier);
+        let half = RATE_WINDOW_SECS / (2 * bucket_secs);
+        if half >= 1 {
+            return format!(
+                "SELECT bucket, (last_value(lvl) OVER w - first_value(lvl) OVER w) * 3600.0 \
+                 / NULLIF(EXTRACT(EPOCH FROM (last_value(bucket) OVER w - first_value(bucket) OVER w)), 0) AS value \
+                 FROM (SELECT {bucket_expr} AS bucket, interpolate({level}) AS lvl \
+                 FROM {table} WHERE uuid = $1 AND {tcol} >= $2 AND {tcol} < $3 GROUP BY 1) s \
+                 WINDOW w AS (ORDER BY bucket ROWS BETWEEN {half} PRECEDING AND {half} FOLLOWING) \
+                 ORDER BY bucket"
+            );
+        }
+        return format!(
+            "SELECT bucket, (lvl - lag(lvl) OVER (ORDER BY bucket)) * 3600.0 / {bucket_secs} AS value \
+             FROM (SELECT {bucket_expr} AS bucket, interpolate({level}) AS lvl \
+             FROM {table} WHERE uuid = $1 AND {tcol} >= $2 AND {tcol} < $3 GROUP BY 1) s \
+             ORDER BY bucket"
+        );
+    }
 
     // Fill an empty bucket per the resolved mode: locf carries the last level,
     // interpolate ramps between points, none leaves it NULL (coalesced to 0 when
@@ -350,8 +417,6 @@ fn build_sql(
         Gapfill::Interpolate => format!("interpolate({base})"),
         Gapfill::None => base.to_owned(),
     };
-    let table = tier.table();
-    let tcol = tier.tcol();
     format!(
         "SELECT {bucket_expr} AS bucket, {value} AS value \
          FROM {table} \
@@ -420,16 +485,16 @@ fn agg_from_mode(mode: Option<&str>) -> Agg {
     }
 }
 
-/// The gapfill to use when a series names none explicitly. `delta`/`integral`
-/// are accumulations: an empty bucket is a genuine zero (no flow, no counter
-/// change), so they never carry. The gauge aggregations straddle two cases the
-/// chart type tells apart — a bar is a quantity that reads 0 when absent, a line
-/// is a level that holds between samples. So a line carries the last level
-/// (`locf`); zoomed in past the on-change log cadence it stays a curve instead
-/// of picket-fencing down to 0 on every empty bucket.
+/// The gapfill to use when a series names none explicitly. `delta`/`integral`/
+/// `rate` are accumulations: an empty bucket is a genuine zero (no flow, no
+/// counter change, 0 kW), so they never carry. The gauge aggregations straddle
+/// two cases the chart type tells apart — a bar is a quantity that reads 0 when
+/// absent, a line is a level that holds between samples. So a line carries the
+/// last level (`locf`); zoomed in past the on-change log cadence it stays a curve
+/// instead of picket-fencing down to 0 on every empty bucket.
 fn default_gapfill(agg: Agg, kind: SeriesType) -> Gapfill {
     match agg {
-        Agg::Delta | Agg::Integral => Gapfill::None,
+        Agg::Delta | Agg::Integral | Agg::Rate => Gapfill::None,
         _ => match kind {
             SeriesType::Bar => Gapfill::None,
             SeriesType::Line => Gapfill::Locf,
@@ -660,6 +725,63 @@ mod tests {
         );
     }
 
+    // --- rate: interpolate the counter level, then difference it (windowed when
+    // the bucket is fine, plain adjacent when coarse), /dt ---
+
+    #[test]
+    fn rate_on_raw_differences_the_interpolated_level_over_a_centered_window() {
+        // 1h span → the 5-second raw bucket, finer than RATE_WINDOW_SECS (240s), so
+        // rate differences the interpolated level over a centered ±24-bucket window
+        // (240s) and divides by the frame's actual span for a per-hour rate.
+        assert_eq!(
+            sql_for_span(Agg::Rate, 3_600),
+            "SELECT bucket, (last_value(lvl) OVER w - first_value(lvl) OVER w) * 3600.0 \
+             / NULLIF(EXTRACT(EPOCH FROM (last_value(bucket) OVER w - first_value(bucket) OVER w)), 0) AS value \
+             FROM (SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+             interpolate(last(value, ts)) AS lvl \
+             FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1) s \
+             WINDOW w AS (ORDER BY bucket ROWS BETWEEN 24 PRECEDING AND 24 FOLLOWING) \
+             ORDER BY bucket"
+        );
+    }
+
+    #[test]
+    fn rate_rolls_up_on_a_cagg_via_interpolated_level_difference() {
+        // 60 days → the 2-hour readings_1h bucket (7200s), far coarser than the
+        // window, so its per-tick quantum is negligible: rate keeps the plain
+        // adjacent-bucket difference of the cagg's interpolated last_val, /7200.
+        assert_eq!(
+            sql_for_span(Agg::Rate, 60 * DAY_SECS),
+            "SELECT bucket, (lvl - lag(lvl) OVER (ORDER BY bucket)) * 3600.0 / 7200 AS value \
+             FROM (SELECT time_bucket_gapfill('2 hours', bucket, $2::timestamptz, $3::timestamptz) AS bucket, \
+             interpolate(last(last_val, bucket)) AS lvl \
+             FROM readings_1h WHERE uuid = $1 AND bucket >= $2 AND bucket < $3 GROUP BY 1) s \
+             ORDER BY bucket"
+        );
+    }
+
+    #[test]
+    fn rate_keeps_the_adjacent_difference_at_coarse_raw_buckets() {
+        // A raw bucket at least as wide as the window (here 5 minutes, half = 0)
+        // needs no smoothing, so rate falls back to the plain adjacent difference
+        // even on the raw tier, /300.
+        assert_eq!(
+            sql_for_span(Agg::Rate, 300 * TARGET_BUCKETS),
+            "SELECT bucket, (lvl - lag(lvl) OVER (ORDER BY bucket)) * 3600.0 / 300 AS value \
+             FROM (SELECT time_bucket_gapfill('5 minutes', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+             interpolate(last(value, ts)) AS lvl \
+             FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1) s \
+             ORDER BY bucket"
+        );
+    }
+
+    #[test]
+    fn rate_is_not_raw_only() {
+        // Rate composes on the caggs exactly like delta, so it is never forced to
+        // the raw tier (the cagg rollup test above depends on this).
+        assert!(!is_raw_only(Agg::Rate));
+    }
+
     // --- calendar-day bucketing (the daily-reset-counter case) ---
 
     #[test]
@@ -814,6 +936,23 @@ mod tests {
     }
 
     #[test]
+    fn schedule_minute_width_for_rate_differences_the_interpolated_level() {
+        // 5h span → the 1m clock rule (60s), finer than the window: rate reads raw,
+        // interpolates the level and differences it over a centered ±2-bucket
+        // window (240s), dividing by the frame's actual span.
+        assert_eq!(
+            sched_sql(Agg::Rate, 5 * HOUR_SECS),
+            "SELECT bucket, (last_value(lvl) OVER w - first_value(lvl) OVER w) * 3600.0 \
+             / NULLIF(EXTRACT(EPOCH FROM (last_value(bucket) OVER w - first_value(bucket) OVER w)), 0) AS value \
+             FROM (SELECT time_bucket_gapfill('1 minute', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+             interpolate(last(value, ts)) AS lvl \
+             FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1) s \
+             WINDOW w AS (ORDER BY bucket ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) \
+             ORDER BY bucket"
+        );
+    }
+
+    #[test]
     fn finest_bucket_for_a_tiny_span() {
         // span < TARGET_BUCKETS → ideal 0 → the 1-second floor.
         assert_eq!(
@@ -907,9 +1046,10 @@ mod tests {
 
     #[test]
     fn accumulations_default_to_none_regardless_of_type() {
-        // delta/integral have a genuine zero in an empty bucket; the type never
-        // overrides that, so a counter charted as a line still reads 0, not locf.
-        for agg in [Agg::Delta, Agg::Integral] {
+        // delta/integral/rate have a genuine zero in an empty bucket; the type
+        // never overrides that, so a counter charted as a line still reads 0 (0 kW
+        // for rate), not locf.
+        for agg in [Agg::Delta, Agg::Integral, Agg::Rate] {
             assert_eq!(default_gapfill(agg, SeriesType::Line), Gapfill::None);
             assert_eq!(default_gapfill(agg, SeriesType::Bar), Gapfill::None);
         }
