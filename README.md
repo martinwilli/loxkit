@@ -1,4 +1,9 @@
-# loxkit
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/loxkit-logo-dark.svg">
+    <img alt="loxkit" src="assets/loxkit-logo-light.svg" width="300">
+  </picture>
+</p>
 
 loxkit bridges a [Loxone](https://www.loxone.com/) Miniserver into
 [TimescaleDB](https://www.timescale.com/) and serves config-driven dashboards
