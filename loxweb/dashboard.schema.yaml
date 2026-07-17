@@ -310,9 +310,10 @@ $defs:
     description: >-
       The aggregation applied when bucketing a bound series. avg/max/min/median/
       last are plain reducers; delta is the counter delta over the bucket and
-      integral its time-weighted integral.
+      integral its time-weighted integral; rate is the counter delta per bucket
+      duration (e.g. kW from a kWh counter).
     type: string
-    enum: [avg, max, min, median, last, delta, integral]
+    enum: [avg, max, min, median, last, delta, integral, rate]
 
   gapfill:
     description: >-
