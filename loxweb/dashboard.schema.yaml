@@ -308,11 +308,13 @@ $defs:
   agg:
     description: >-
       The aggregation applied when bucketing a bound series. avg/max/min/median/
-      last are plain reducers; delta is the counter delta over the bucket and
-      integral its time-weighted integral; rate is the counter delta per bucket
-      duration (e.g. kW from a kWh counter).
+      last are plain reducers; geomean is the geometric mean of the positive
+      samples (the natural mean for a ratio, dropping off/invalid non-positive
+      readings); delta is the counter delta over the bucket and integral its
+      time-weighted integral; rate is the counter delta per bucket duration (e.g.
+      kW from a kWh counter).
     type: string
-    enum: [avg, max, min, median, last, delta, integral, rate]
+    enum: [avg, max, min, median, geomean, last, delta, integral, rate]
 
   gapfill:
     description: >-

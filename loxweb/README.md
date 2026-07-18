@@ -58,7 +58,7 @@ views:
 | Key | Meaning |
 |-----|---------|
 | `uuid` | Bound series: the store series to read (a `series_meta.uuid`). |
-| `agg` | `avg` \| `max` \| `min` \| `median` \| `last` (plain), or `delta` \| `integral` \| `rate` (counter / time-weighted / counter delta per bucket duration, e.g. kW from a kWh counter). Absent resolves from the series' stored kind. |
+| `agg` | `avg` \| `max` \| `min` \| `median` \| `geomean` \| `last` (plain; `geomean` is the geometric mean of the positive samples, the natural mean for a ratio and robust to off/invalid zeros), or `delta` \| `integral` \| `rate` (counter / time-weighted / counter delta per bucket duration, e.g. kW from a kWh counter). Absent resolves from the series' stored kind. |
 | `expr` | Derived series: `+ - * /`, parens, constants, and sibling series `id`s. Evaluated in declaration order, so a derived series may reference an earlier one. |
 | `type` | `line` (default), `fill` (line over a flat area), `area` (that flat fill on its own, no line), `gradient` (line with a fill fading to the baseline, per band when stacked), or `bar`; may be mixed in one panel. |
 | `axis` | Which declared axis `id` the series is drawn against. |

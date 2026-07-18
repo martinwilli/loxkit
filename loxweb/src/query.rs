@@ -216,7 +216,7 @@ impl Tier {
 /// can't be composed from bucket rollups at all, so `median` alone forces the
 /// raw tier.
 fn is_raw_only(agg: Agg) -> bool {
-    matches!(agg, Agg::Median)
+    matches!(agg, Agg::Median | Agg::Geomean)
 }
 
 /// The first ladder step at least as wide as `ideal`, or the widest step when
@@ -261,6 +261,12 @@ fn value_expr(agg: Agg, tier: Tier) -> &'static str {
             Agg::Min => "min(value)",
             Agg::Last => "last(value, ts)",
             Agg::Median => "percentile_cont(0.5) WITHIN GROUP (ORDER BY value)",
+            // Geometric mean of the positive samples: exp(mean(ln)). The FILTER
+            // drops non-positive readings (an off mode logging 0, or a negative
+            // glitch) so they neither pull the mean down nor break ln(); a bucket
+            // with no positive sample yields NULL, which gapfill: gap keeps as a
+            // real gap. Forces the raw tier (route()); no cagg carries sum(ln).
+            Agg::Geomean => "exp(avg(ln(value)) FILTER (WHERE value > 0))",
             // Net change over the bucket: last value minus first. Deliberately
             // NOT delta(counter_agg(...)): a counter that dithers in its last
             // float ULP (or takes the odd sub-unit backward correction) trips
@@ -300,6 +306,9 @@ fn value_expr(agg: Agg, tier: Tier) -> &'static str {
             Agg::Integral => "integral(rollup(tw))",
             Agg::Median => {
                 unreachable!("median forces the raw tier in route()")
+            }
+            Agg::Geomean => {
+                unreachable!("geomean forces the raw tier in route()")
             }
         },
     }
@@ -727,6 +736,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn geomean_forces_raw_and_filters_nonpositive() {
+        // Like median, geomean can't compose from the caggs (no stored sum(ln)),
+        // so a huge span still sources from readings. The FILTER drops the
+        // non-positive samples so an off/invalid 0 is excluded from the mean.
+        assert_eq!(
+            sql_for_span(Agg::Geomean, 1_000 * DAY_SECS),
+            "SELECT time_bucket_gapfill('1 day', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+             exp(avg(ln(value)) FILTER (WHERE value > 0)) AS value \
+             FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
+        );
+    }
+
     // --- rate: interpolate the counter level, then difference it (windowed when
     // the bucket is fine, plain adjacent when coarse), /dt ---
 
@@ -782,6 +804,14 @@ mod tests {
         // Rate composes on the caggs exactly like delta, so it is never forced to
         // the raw tier (the cagg rollup test above depends on this).
         assert!(!is_raw_only(Agg::Rate));
+    }
+
+    #[test]
+    fn median_and_geomean_are_raw_only() {
+        // Both need per-point data the caggs don't carry (a percentile, a sum of
+        // logs), so route() pins them to the raw tier regardless of span.
+        assert!(is_raw_only(Agg::Median));
+        assert!(is_raw_only(Agg::Geomean));
     }
 
     // --- calendar-day bucketing (the daily-reset-counter case) ---

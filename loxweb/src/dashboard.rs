@@ -460,6 +460,13 @@ pub enum Agg {
     Max,
     Min,
     Median,
+    /// Geometric mean of the positive samples: exp(avg(ln(value))) over
+    /// value > 0. The natural mean for a ratio (a COP, an efficiency), and it
+    /// drops the non-positive readings, so an off/invalid 0 neither pulls the
+    /// mean down nor breaks ln(), and a wholly-off bucket comes out empty (a
+    /// gap) rather than zero. Like median it can't compose from the caggs, so
+    /// it forces the raw tier.
+    Geomean,
     /// Last value in the bucket.
     Last,
     /// Counter delta over the bucket.
