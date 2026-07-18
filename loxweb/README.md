@@ -60,7 +60,7 @@ views:
 | `uuid` | Bound series: the store series to read (a `series_meta.uuid`). |
 | `agg` | `avg` \| `max` \| `min` \| `median` \| `last` (plain), or `delta` \| `integral` \| `rate` (counter / time-weighted / counter delta per bucket duration, e.g. kW from a kWh counter). Absent resolves from the series' stored kind. |
 | `expr` | Derived series: `+ - * /`, parens, constants, and sibling series `id`s. Evaluated in declaration order, so a derived series may reference an earlier one. |
-| `type` | `line` (default), `fill` (line over a flat area), `area` (that flat fill on its own, no line), or `bar`; may be mixed in one panel. |
+| `type` | `line` (default), `fill` (line over a flat area), `area` (that flat fill on its own, no line), `gradient` (line with a fill fading to the baseline, per band when stacked), or `bar`; may be mixed in one panel. |
 | `axis` | Which declared axis `id` the series is drawn against. |
 | `stack` | Series sharing a group stack together; a `scale: -1` series stacks below zero within its group. |
 | `stack_strategy` | `samesign` (default) keeps mirrored (`scale: -1`) members below zero; `all` stacks across signs, for a min-max band whose base goes negative; `negative` pins a member below zero regardless of its per-bucket sign, for a derived series that must stay there even when noise nudges it across zero. |

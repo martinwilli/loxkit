@@ -282,9 +282,10 @@ $defs:
   seriesType:
     description: >-
       A series' chart type. fill draws a line over a flat area; area is that flat
-      fill on its own, no line.
+      fill on its own, no line; gradient draws a line whose fill fades from the
+      line down to the baseline (per stacked band when stacked).
     type: string
-    enum: [line, fill, area, bar]
+    enum: [line, fill, area, gradient, bar]
     default: line
 
   interp:

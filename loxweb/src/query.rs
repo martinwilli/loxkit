@@ -497,7 +497,9 @@ fn default_gapfill(agg: Agg, kind: SeriesType) -> Gapfill {
         Agg::Delta | Agg::Integral | Agg::Rate => Gapfill::None,
         _ => match kind {
             SeriesType::Bar => Gapfill::None,
-            SeriesType::Line | SeriesType::Fill | SeriesType::Area => Gapfill::Locf,
+            SeriesType::Line | SeriesType::Fill | SeriesType::Area | SeriesType::Gradient => {
+                Gapfill::Locf
+            }
         },
     }
 }

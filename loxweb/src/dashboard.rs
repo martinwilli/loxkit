@@ -410,6 +410,8 @@ pub enum SeriesType {
     Fill,
     /// A flat area fill on its own, with no line drawn on top.
     Area,
+    /// A line whose area fill fades from the line down to the baseline.
+    Gradient,
     /// Bars.
     Bar,
 }

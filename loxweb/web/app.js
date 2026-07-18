@@ -698,6 +698,19 @@
           // No line to anchor it, so the fill carries the series alone: give it
           // more presence than the subtle wash "fill" lays under its line.
           opt.areaStyle = { color: color, opacity: 0.5 };
+        } else if (s.type === "gradient") {
+          // Fade the fill from the line down to the baseline. The (0,0,0,1)
+          // coords are relative to each series' own fill polygon, so a stacked
+          // member fades within its own band, not across the whole chart. Pin
+          // opacity to 1 so the per-stop alpha is exactly what shows (areaStyle
+          // otherwise defaults to 0.7 and would dim both stops).
+          opt.areaStyle = {
+            opacity: 1,
+            color: new global.echarts.graphic.LinearGradient(0, 0, 0, 1, [
+              { offset: 0, color: global.echarts.color.modifyAlpha(color, 0.3) },
+              { offset: 1, color: global.echarts.color.modifyAlpha(color, 0) },
+            ]),
+          };
         }
       } else {
         opt.itemStyle = { color: color, borderRadius: [3, 3, 0, 0] };
