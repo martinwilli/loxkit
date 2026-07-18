@@ -689,9 +689,15 @@
           opt.step = mode.step;
         }
         opt.showSymbol = false;
-        opt.lineStyle = { width: 2, color: color };
-        if (s.fill) {
+        // "area" is the fill on its own, so drop its line stroke; the others keep
+        // the 2px line.
+        opt.lineStyle = { width: s.type === "area" ? 0 : 2, color: color };
+        if (s.type === "fill") {
           opt.areaStyle = { color: color, opacity: 0.15 };
+        } else if (s.type === "area") {
+          // No line to anchor it, so the fill carries the series alone: give it
+          // more presence than the subtle wash "fill" lays under its line.
+          opt.areaStyle = { color: color, opacity: 0.5 };
         }
       } else {
         opt.itemStyle = { color: color, borderRadius: [3, 3, 0, 0] };

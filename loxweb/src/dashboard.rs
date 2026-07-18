@@ -120,7 +120,7 @@ pub struct Series {
     /// Target axis id (must name an [`Axis`] in the same panel).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub axis: Option<String>,
-    /// Draw as a line or bars.
+    /// Draw as a line, a filled area, or bars.
     #[serde(rename = "type", default)]
     pub kind: SeriesType,
     /// Explicit color; absent uses the default palette.
@@ -129,9 +129,6 @@ pub struct Series {
     /// Line interpolation.
     #[serde(default)]
     pub interp: Interp,
-    /// Fill the area under a line.
-    #[serde(default)]
-    pub fill: bool,
     /// Computed for `expr` references but never drawn — no legend entry, no
     /// plotted line/bars. For a bound input a derived sibling needs that has no
     /// place on the panel itself (a raw counter feeding a ratio, say). Requires
@@ -409,6 +406,10 @@ pub enum SeriesType {
     /// A line (the default).
     #[default]
     Line,
+    /// A line with a flat area fill beneath it.
+    Fill,
+    /// A flat area fill on its own, with no line drawn on top.
+    Area,
     /// Bars.
     Bar,
 }

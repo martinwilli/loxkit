@@ -143,7 +143,7 @@ $defs:
           at load). Absent uses the panel's implicit/first axis.
         type: string
       type:
-        description: Draw as a line or bars.
+        description: Draw as a line, a filled area, or bars.
         $ref: "#/$defs/seriesType"
       color:
         description: Explicit CSS color; absent uses the default palette.
@@ -151,10 +151,6 @@ $defs:
       interp:
         description: Line interpolation (ignored for bars).
         $ref: "#/$defs/interp"
-      fill:
-        description: Fill the area under a line (ignored for bars).
-        type: boolean
-        default: false
       hidden:
         description: >-
           Computed for expr references but never drawn (no legend, no line/bars),
@@ -284,9 +280,11 @@ $defs:
     enum: [left, right]
 
   seriesType:
-    description: A series' chart type.
+    description: >-
+      A series' chart type. fill draws a line over a flat area; area is that flat
+      fill on its own, no line.
     type: string
-    enum: [line, bar]
+    enum: [line, fill, area, bar]
     default: line
 
   interp:

@@ -43,7 +43,7 @@ views:
           - {id: temp, side: left,  unit: "°C", min: 0, max: 40}
           - {id: hum,  side: right, unit: "%",  min: 0, max: 100}
         series:
-          - {id: t_in, label: Indoor, uuid: <u>, agg: avg, type: line, axis: temp, interp: smooth, fill: true}
+          - {id: t_in, label: Indoor, uuid: <u>, agg: avg, type: fill, axis: temp, interp: smooth}
           - {label: Humidity, uuid: <u>, agg: avg, type: bar, axis: hum, color: "#8bc34a"}
           - {label: Ratio, expr: "t_in / 100", type: line, axis: temp}
   - id: energy
@@ -60,14 +60,13 @@ views:
 | `uuid` | Bound series: the store series to read (a `series_meta.uuid`). |
 | `agg` | `avg` \| `max` \| `min` \| `median` \| `last` (plain), or `delta` \| `integral` \| `rate` (counter / time-weighted / counter delta per bucket duration, e.g. kW from a kWh counter). Absent resolves from the series' stored kind. |
 | `expr` | Derived series: `+ - * /`, parens, constants, and sibling series `id`s. Evaluated in declaration order, so a derived series may reference an earlier one. |
-| `type` | `line` (default) or `bar`; may be mixed in one panel. |
+| `type` | `line` (default), `fill` (line over a flat area), `area` (that flat fill on its own, no line), or `bar`; may be mixed in one panel. |
 | `axis` | Which declared axis `id` the series is drawn against. |
 | `stack` | Series sharing a group stack together; a `scale: -1` series stacks below zero within its group. |
 | `stack_strategy` | `samesign` (default) keeps mirrored (`scale: -1`) members below zero; `all` stacks across signs, for a min-max band whose base goes negative; `negative` pins a member below zero regardless of its per-bucket sign, for a derived series that must stay there even when noise nudges it across zero. |
 | `scale` | Multiplier applied to every value, e.g. `-1` to mirror or `0.001` to rescale units. |
 | `color` | A CSS color; absent uses the default palette. |
 | `interp` | `linear` (default), `smooth`, or `step`. |
-| `fill` | `true` to fill the area under a line. |
 | `label` | Legend label. |
 
 ### Axes
