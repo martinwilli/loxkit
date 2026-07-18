@@ -320,6 +320,7 @@ $defs:
     description: >-
       How an empty bucket gets a value on the shared query grid: locf carries the
       last observed value forward, interpolate linearly interpolates between the
-      surrounding points, none leaves it empty (read as 0).
+      surrounding points, none leaves it empty (read as 0), gap leaves it a real
+      gap (the line breaks there rather than diving to 0).
     type: string
-    enum: [locf, interpolate, none]
+    enum: [locf, interpolate, none, gap]

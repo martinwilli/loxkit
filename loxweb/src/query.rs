@@ -424,7 +424,9 @@ fn build_sql(
     let value = match gapfill {
         Gapfill::Locf => format!("locf({base})"),
         Gapfill::Interpolate => format!("interpolate({base})"),
-        Gapfill::None => base.to_owned(),
+        // Both leave the aggregate bare; they differ only in how a resulting NULL
+        // is mapped to a point below (none -> 0, gap -> a real gap).
+        Gapfill::None | Gapfill::Gap => base.to_owned(),
     };
     format!(
         "SELECT {bucket_expr} AS bucket, {value} AS value \
@@ -550,11 +552,13 @@ pub async fn query_series(pool: &Pool, req: &SeriesRequest) -> Result<SeriesResu
         // is an *unseedable* edge: a leading gap before the first in-window sample
         // that locf cannot carry into (the WHERE clips the prior reading away). A
         // fake 0 there dives the line to the baseline and drags the axis down, so
-        // keep it NULL and let the frontend draw a real gap.
+        // keep it NULL and let the frontend draw a real gap. `gap` goes further:
+        // every NULL — empty or all-filtered (e.g. geomean over an off bucket) —
+        // is deliberately a gap, so pass it through too.
         let raw = row.get::<_, Option<f64>>(1);
         let v = match gapfill {
             Gapfill::None => Some(raw.unwrap_or(0.0)),
-            Gapfill::Locf | Gapfill::Interpolate => raw,
+            Gapfill::Gap | Gapfill::Locf | Gapfill::Interpolate => raw,
         };
         points.push(Point { t, v });
     }
@@ -1048,6 +1052,19 @@ mod tests {
         // none is the default; on a gauge it leaves the bare aggregate, and an
         // empty bucket reads 0 when rows are mapped.
         let sql = build_sql(Agg::Avg, Gapfill::None, 3_600, None);
+        assert_eq!(
+            sql,
+            "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \
+             avg(value) AS value \
+             FROM readings WHERE uuid = $1 AND ts >= $2 AND ts < $3 GROUP BY 1 ORDER BY 1"
+        );
+    }
+
+    #[test]
+    fn gap_leaves_the_aggregate_bare_like_none() {
+        // gap emits the same bare aggregate as none; the two diverge only when
+        // rows are mapped (none coalesces a NULL to 0, gap keeps it a real gap).
+        let sql = build_sql(Agg::Avg, Gapfill::Gap, 3_600, None);
         assert_eq!(
             sql,
             "SELECT time_bucket_gapfill('5 seconds', ts, $2::timestamptz, $3::timestamptz) AS bucket, \

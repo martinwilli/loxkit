@@ -497,6 +497,11 @@ pub enum Gapfill {
     /// accumulation, or an on-change meter that goes quiet at zero — the resolved
     /// default for a bar and for delta/integral.
     None,
+    /// Leave an empty (or all-filtered) bucket as a real gap: unlike `None` it is
+    /// not read as 0, so the line simply breaks there and resumes when data
+    /// returns. For a signal that is genuinely absent when it's absent, like a
+    /// per-mode COP that only exists while that mode runs.
+    Gap,
 }
 
 fn default_scale() -> f64 {
