@@ -23,9 +23,10 @@
 //! but never over a real state that happens to share it.
 //!
 //! A control can also define `statistic.outputs`: named, printf-formatted series
-//! the operator chose to log. Each output carries its own name and unit, so it
-//! wins over a plain state label for the same uuid, and some outputs have a
-//! dedicated uuid that is not a state at all.
+//! the operator chose to log. Each output carries its own label and unit, so its
+//! sub and unit win over a plain state's for the same uuid while the control name
+//! stays the series identity, and some outputs have a dedicated uuid that is not a
+//! state at all.
 //!
 //! Freshness is cheap to check: `jdev/sps/LoxAPPversion3` returns the same
 //! `lastModified` stamp the structure file carries, so the (large) file is only
@@ -381,11 +382,12 @@ fn index_control(
     }
 
     // Statistic outputs are the series the operator configured this control to
-    // log, each with its own name and printf format. They win over a plain state
-    // label for the same uuid (a chosen name and unit beat the terse state sub),
-    // and some outputs have a dedicated uuid that is no state at all. Insert (not
-    // or_insert) so they overwrite any state entry above; uuids are globally
-    // unique, so this only ever replaces this control's own state.
+    // log, each with its own name, printf format and visuType. Their sub and unit
+    // win over a plain state's for the same uuid (a chosen label and unit beat the
+    // terse state sub) while the control name stays the series identity, and some
+    // outputs have a dedicated uuid that is no state at all. Insert (not or_insert)
+    // so they overwrite any state entry above; uuids are globally unique, so this
+    // only ever replaces this control's own state.
     if let Some(statistic) = &control.statistic {
         for output in &statistic.outputs {
             let Some(uuid) = output
@@ -399,11 +401,13 @@ fn index_control(
                 uuid,
                 StateEntry {
                     control: control.control_type.clone(),
-                    name: output.name.clone(),
+                    name: control.name.clone(),
                     room: room.clone(),
                     category: category.clone(),
-                    // The name is authoritative; carry it as the sub too so the
-                    // sink renders one clean name rather than name/sub.
+                    // Keep the control name as the series identity. A meter's
+                    // output name is a generic axis (Gesamtverbrauch, Leistung)
+                    // shared across every meter, so it belongs in sub, not name,
+                    // or two meters would collapse to one label.
                     sub: output.name.clone(),
                     unit: output.format.as_deref().and_then(unit_from_format),
                     // The output's visuType is Loxone's own gauge/counter signal.
@@ -637,14 +641,16 @@ mod tests {
     }
 
     #[test]
-    fn statistic_output_resolves_with_its_own_name_and_unit() {
+    fn statistic_output_resolves_with_its_own_sub_and_unit() {
         let structure = Structure::parse(FIXTURE).unwrap();
-        // A statistic-only uuid (no matching state) resolves to the output's own
-        // name and format-derived unit, under the owning control's room/category.
+        // A statistic-only uuid (no matching state) resolves under the control
+        // name, carrying the output's own label as the sub and its format-derived
+        // unit, under the owning control's room/category.
         let entry = structure
             .resolve(&uuid("deadbeef-6666-0000-0000000000000002"))
             .unwrap();
-        assert_eq!(entry.name, "Zähler Produktion");
+        assert_eq!(entry.name, "Solar");
+        assert_eq!(entry.sub, "Zähler Produktion");
         assert_eq!(entry.unit.as_deref(), Some("kWh"));
         assert_eq!(entry.room.as_deref(), Some("Room A"));
         assert_eq!(entry.category.as_deref(), Some("Category X"));
@@ -655,14 +661,53 @@ mod tests {
     fn statistic_output_wins_over_a_state_for_the_same_uuid() {
         let structure = Structure::parse(FIXTURE).unwrap();
         // Solar's prodCurr state and statistic output id 0 share a uuid; the
-        // statistic's chosen name and unit win over the terse state.
+        // output's sub and unit win over the terse state, while the control name
+        // stays the series identity.
         let entry = structure
             .resolve(&uuid("deadbeef-6666-0000-0000000000000001"))
             .unwrap();
-        assert_eq!(entry.name, "Leistung Produktion");
+        assert_eq!(entry.name, "Solar");
         assert_eq!(entry.unit.as_deref(), Some("kW"));
-        // sub mirrors the name so the sink renders one clean label, not name/sub.
         assert_eq!(entry.sub, "Leistung Produktion");
+    }
+
+    // Two Meter controls whose statistic outputs share one generic name. Loxone
+    // names every meter's outputs the same (Gesamtverbrauch, Leistung), so this
+    // pins that a shared output name no longer clobbers the unique control name.
+    const COLLISION_FIXTURE: &str = r#"{
+      "controls": {
+        "deadbeef-a111-0000-0000000000000001": {
+          "name": "Totalstrom alt",
+          "type": "Meter",
+          "statistic": { "outputs": [
+            { "name": "Gesamtverbrauch", "format": "%.1f kWh", "visuType": 2, "uuid": "deadbeef-a222-0000-0000000000000001" }
+          ] }
+        },
+        "deadbeef-a111-0000-0000000000000002": {
+          "name": "Heizstrom alt",
+          "type": "Meter",
+          "statistic": { "outputs": [
+            { "name": "Gesamtverbrauch", "format": "%.1f kWh", "visuType": 2, "uuid": "deadbeef-a222-0000-0000000000000002" }
+          ] }
+        }
+      }
+    }"#;
+
+    #[test]
+    fn statistic_outputs_sharing_a_name_keep_distinct_control_identities() {
+        let structure = Structure::parse(COLLISION_FIXTURE).unwrap();
+        // Each meter resolves under its own control name, with the shared generic
+        // output name as the sub: same sub, distinct name, no clobber.
+        let first = structure
+            .resolve(&uuid("deadbeef-a222-0000-0000000000000001"))
+            .unwrap();
+        assert_eq!(first.name, "Totalstrom alt");
+        assert_eq!(first.sub, "Gesamtverbrauch");
+        let second = structure
+            .resolve(&uuid("deadbeef-a222-0000-0000000000000002"))
+            .unwrap();
+        assert_eq!(second.name, "Heizstrom alt");
+        assert_eq!(second.sub, "Gesamtverbrauch");
     }
 
     #[test]
