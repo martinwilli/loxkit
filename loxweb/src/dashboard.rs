@@ -120,7 +120,7 @@ pub struct Series {
     /// Target axis id (must name an [`Axis`] in the same panel).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub axis: Option<String>,
-    /// Draw as a line or bars.
+    /// Draw as a line, a filled area, or bars.
     #[serde(rename = "type", default)]
     pub kind: SeriesType,
     /// Explicit color; absent uses the default palette.
@@ -129,9 +129,6 @@ pub struct Series {
     /// Line interpolation.
     #[serde(default)]
     pub interp: Interp,
-    /// Fill the area under a line.
-    #[serde(default)]
-    pub fill: bool,
     /// Computed for `expr` references but never drawn — no legend entry, no
     /// plotted line/bars. For a bound input a derived sibling needs that has no
     /// place on the panel itself (a raw counter feeding a ratio, say). Requires
@@ -409,6 +406,12 @@ pub enum SeriesType {
     /// A line (the default).
     #[default]
     Line,
+    /// A line with a flat area fill beneath it.
+    Fill,
+    /// A flat area fill on its own, with no line drawn on top.
+    Area,
+    /// A line whose area fill fades from the line down to the baseline.
+    Gradient,
     /// Bars.
     Bar,
 }
@@ -457,10 +460,20 @@ pub enum Agg {
     Max,
     Min,
     Median,
+    /// Geometric mean of the positive samples: exp(avg(ln(value))) over
+    /// value > 0. The natural mean for a ratio (a COP, an efficiency), and it
+    /// drops the non-positive readings, so an off/invalid 0 neither pulls the
+    /// mean down nor breaks ln(), and a wholly-off bucket comes out empty (a
+    /// gap) rather than zero. Like median it can't compose from the caggs, so
+    /// it forces the raw tier.
+    Geomean,
     /// Last value in the bucket.
     Last,
     /// Counter delta over the bucket.
     Delta,
+    /// Counter delta per unit time: the bucket delta divided by the bucket
+    /// duration, a rate (e.g. kW derived from a kWh counter).
+    Rate,
     /// Time-weighted integral over the bucket.
     Integral,
 }
@@ -484,6 +497,11 @@ pub enum Gapfill {
     /// accumulation, or an on-change meter that goes quiet at zero — the resolved
     /// default for a bar and for delta/integral.
     None,
+    /// Leave an empty (or all-filtered) bucket as a real gap: unlike `None` it is
+    /// not read as 0, so the line simply breaks there and resumes when data
+    /// returns. For a signal that is genuinely absent when it's absent, like a
+    /// per-mode COP that only exists while that mode runs.
+    Gap,
 }
 
 fn default_scale() -> f64 {

@@ -143,7 +143,7 @@ $defs:
           at load). Absent uses the panel's implicit/first axis.
         type: string
       type:
-        description: Draw as a line or bars.
+        description: Draw as a line, a filled area, or bars.
         $ref: "#/$defs/seriesType"
       color:
         description: Explicit CSS color; absent uses the default palette.
@@ -151,10 +151,6 @@ $defs:
       interp:
         description: Line interpolation (ignored for bars).
         $ref: "#/$defs/interp"
-      fill:
-        description: Fill the area under a line (ignored for bars).
-        type: boolean
-        default: false
       hidden:
         description: >-
           Computed for expr references but never drawn (no legend, no line/bars),
@@ -284,9 +280,12 @@ $defs:
     enum: [left, right]
 
   seriesType:
-    description: A series' chart type.
+    description: >-
+      A series' chart type. fill draws a line over a flat area; area is that flat
+      fill on its own, no line; gradient draws a line whose fill fades from the
+      line down to the baseline (per stacked band when stacked).
     type: string
-    enum: [line, bar]
+    enum: [line, fill, area, gradient, bar]
     default: line
 
   interp:
@@ -309,15 +308,19 @@ $defs:
   agg:
     description: >-
       The aggregation applied when bucketing a bound series. avg/max/min/median/
-      last are plain reducers; delta is the counter delta over the bucket and
-      integral its time-weighted integral.
+      last are plain reducers; geomean is the geometric mean of the positive
+      samples (the natural mean for a ratio, dropping off/invalid non-positive
+      readings); delta is the counter delta over the bucket and integral its
+      time-weighted integral; rate is the counter delta per bucket duration (e.g.
+      kW from a kWh counter).
     type: string
-    enum: [avg, max, min, median, last, delta, integral]
+    enum: [avg, max, min, median, geomean, last, delta, integral, rate]
 
   gapfill:
     description: >-
       How an empty bucket gets a value on the shared query grid: locf carries the
       last observed value forward, interpolate linearly interpolates between the
-      surrounding points, none leaves it empty (read as 0).
+      surrounding points, none leaves it empty (read as 0), gap leaves it a real
+      gap (the line breaks there rather than diving to 0).
     type: string
-    enum: [locf, interpolate, none]
+    enum: [locf, interpolate, none, gap]

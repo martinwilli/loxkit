@@ -48,11 +48,10 @@ views:
             label: Indoor Temp
             uuid: deadbeef-0000-0000-0000-000000000001
             agg: avg
-            type: line
+            type: fill
             axis: temp
             color: "#4a7fb5"
             interp: smooth
-            fill: true
           - id: t_out
             label: Outdoor Temp
             uuid: deadbeef-0000-0000-0000-000000000002
