@@ -294,11 +294,17 @@ struct RawControl {
     statistic: Option<RawStatistic>,
 }
 
-/// A control's display details; we mine the format string for a unit.
+/// A control's display details; we mine the format strings for a unit. An
+/// InfoOnlyAnalog carries a single format; a Meter has no format and instead
+/// carries actualFormat (its power sub) and totalFormat (its energy subs).
 #[derive(Deserialize)]
 struct RawDetails {
     #[serde(default)]
     format: Option<String>,
+    #[serde(rename = "actualFormat", default)]
+    actual_format: Option<String>,
+    #[serde(rename = "totalFormat", default)]
+    total_format: Option<String>,
 }
 
 /// The `statistic` block on a control: the outputs it logs.
@@ -349,17 +355,41 @@ fn index_control(
         .and_then(|id| cats.get(id))
         .map(|c| c.name.clone())
         .or_else(|| inherited_cat.map(str::to_owned));
-    let unit = control
-        .details
-        .as_ref()
+    let is_meter = control.control_type == "Meter";
+    // A Meter's two units differ by sub (kW for power, kWh for energy), so one
+    // details.format can't cover both; it lists them separately as actualFormat
+    // and totalFormat. Precompute all three candidates and pick by sub below.
+    let details = control.details.as_ref();
+    let format_unit = details
         .and_then(|d| d.format.as_deref())
+        .and_then(unit_from_format);
+    let actual_unit = details
+        .and_then(|d| d.actual_format.as_deref())
+        .and_then(unit_from_format);
+    let total_unit = details
+        .and_then(|d| d.total_format.as_deref())
         .and_then(unit_from_format);
 
     for (sub, value) in &control.states {
-        // The control's `details.format` describes its primary `value` state;
-        // every other state (an analog sensor's `error` flag, a status/enum
-        // state) carries no unit of its own, so a wrong unit never beats none.
-        let entry_unit = if sub == "value" { unit.clone() } else { None };
+        // Pick the unit by sub. On a Meter, an actual* sub is power (kW) from
+        // actualFormat and a total* sub (total, totalNeg, the resetting period
+        // totals) is energy (kWh) from totalFormat. Otherwise details.format
+        // describes the primary `value` state only; every other state (an analog
+        // sensor's `error` flag, a status/enum state) carries no unit of its own,
+        // so a wrong unit never beats none.
+        let entry_unit = if is_meter {
+            if sub.starts_with("actual") {
+                actual_unit.clone()
+            } else if sub.starts_with("total") {
+                total_unit.clone()
+            } else {
+                None
+            }
+        } else if sub == "value" {
+            format_unit.clone()
+        } else {
+            None
+        };
         for uuid_str in state_uuids(value) {
             if let Ok(uuid) = uuid_str.parse::<LoxUuid>() {
                 out.insert(
@@ -708,6 +738,43 @@ mod tests {
             .unwrap();
         assert_eq!(second.name, "Heizstrom alt");
         assert_eq!(second.sub, "Gesamtverbrauch");
+    }
+
+    // A modern unidirectional Meter: no format and no statistic block, just raw
+    // states plus actualFormat/totalFormat. Exercises the by-sub unit pick and
+    // (in a later commit) the by-sub counter classification.
+    const METER_FIXTURE: &str = r#"{
+      "controls": {
+        "deadbeef-7777-0000-0000000000000001": {
+          "name": "Netz",
+          "type": "Meter",
+          "details": { "actualFormat": "%.3fkW", "totalFormat": "%.1fkWh" },
+          "states": {
+            "actual": "deadbeef-8888-0000-0000000000000001",
+            "total": "deadbeef-8888-0000-0000000000000002",
+            "totalNeg": "deadbeef-8888-0000-0000000000000003",
+            "totalDay": "deadbeef-8888-0000-0000000000000004"
+          }
+        }
+      }
+    }"#;
+
+    #[test]
+    fn meter_units_come_from_actual_and_total_format() {
+        let structure = Structure::parse(METER_FIXTURE).unwrap();
+        // The actual* sub takes kW from actualFormat...
+        let actual = structure
+            .resolve(&uuid("deadbeef-8888-0000-0000000000000001"))
+            .unwrap();
+        assert_eq!(actual.unit.as_deref(), Some("kW"));
+        // ...and every total* sub takes kWh from totalFormat.
+        for id in [
+            "deadbeef-8888-0000-0000000000000002",
+            "deadbeef-8888-0000-0000000000000003",
+            "deadbeef-8888-0000-0000000000000004",
+        ] {
+            assert_eq!(structure.resolve(&uuid(id)).unwrap().unit.as_deref(), Some("kWh"));
+        }
     }
 
     #[test]
