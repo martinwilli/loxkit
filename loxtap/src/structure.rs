@@ -390,6 +390,11 @@ fn index_control(
         } else {
             None
         };
+        let entry_agg_mode = if is_meter && matches!(sub.as_str(), "total" | "totalNeg") {
+            AggMode::Counter
+        } else {
+            AggMode::Gauge
+        };
         for uuid_str in state_uuids(value) {
             if let Ok(uuid) = uuid_str.parse::<LoxUuid>() {
                 out.insert(
@@ -401,10 +406,13 @@ fn index_control(
                         category: category.clone(),
                         sub: sub.clone(),
                         unit: entry_unit.clone(),
-                        // A plain state carries no statistic output, so it is a
-                        // gauge; a visuType-2 output for the same uuid overwrites
-                        // this below and reclassifies it as a counter.
-                        agg_mode: AggMode::Gauge,
+                        // A Meter's total/totalNeg are monotonic counters,
+                        // classified here from the control type and sub with no
+                        // visuType to lean on; the resetting period totals stay
+                        // gauge for now. Any other plain state is a gauge too. A
+                        // statistic visuType-2 output for the same uuid still
+                        // overwrites this below and reclassifies it as a counter.
+                        agg_mode: entry_agg_mode,
                     },
                 );
             }
@@ -775,6 +783,25 @@ mod tests {
         ] {
             assert_eq!(structure.resolve(&uuid(id)).unwrap().unit.as_deref(), Some("kWh"));
         }
+    }
+
+    #[test]
+    fn meter_total_states_classify_as_counters() {
+        let structure = Structure::parse(METER_FIXTURE).unwrap();
+        // The monotonic total accumulator is a counter, seen through both the
+        // resolve() entry and the series_meta() a sink upserts.
+        let total = uuid("deadbeef-8888-0000-0000000000000002");
+        assert_eq!(structure.resolve(&total).unwrap().agg_mode, AggMode::Counter);
+        assert_eq!(structure.series_meta(&total).unwrap().agg_mode, AggMode::Counter);
+        // totalNeg (the export counter) is a counter too.
+        let total_neg = uuid("deadbeef-8888-0000-0000000000000003");
+        assert_eq!(structure.resolve(&total_neg).unwrap().agg_mode, AggMode::Counter);
+        // The instantaneous actual power stays a gauge...
+        let actual = uuid("deadbeef-8888-0000-0000000000000001");
+        assert_eq!(structure.resolve(&actual).unwrap().agg_mode, AggMode::Gauge);
+        // ...as does the resetting per-day total.
+        let total_day = uuid("deadbeef-8888-0000-0000000000000004");
+        assert_eq!(structure.resolve(&total_day).unwrap().agg_mode, AggMode::Gauge);
     }
 
     #[test]
