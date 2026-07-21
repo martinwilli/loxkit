@@ -10,10 +10,11 @@
 //!   it to a [`SeriesRequest`], and returns `{unit, points}`: the store's unit
 //!   label (the display default) and the tier-routed points as an ECharts-native
 //!   `[[t_ms, value], …]` array.
-//! * `/`, `/app.js`, `/style.css`, `/echarts.min.js` are the SPA and the vendored
-//!   ECharts bundle, compiled into the binary with `include_str!` and served from
-//!   explicit routes — no runtime asset directory, so a bare `cargo run` and the
-//!   packaged binary both work with zero asset-path config.
+//! * `/`, `/app.js`, `/style.css`, `/echarts.min.js`, `/favicon.svg` are the SPA,
+//!   the vendored ECharts bundle, and the favicon, compiled into the binary with
+//!   `include_str!` and served from explicit routes — no runtime asset directory,
+//!   so a bare `cargo run` and the packaged binary both work with zero asset-path
+//!   config.
 //!
 //! **base_path.** A reverse proxy may mount loxweb under a sub-path (e.g.
 //! `/app`). That is handled entirely server-side so the frontend uses only
@@ -57,6 +58,7 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const STYLE_CSS: &str = include_str!("../web/style.css");
 const ECHARTS_JS: &str = include_str!("../web/echarts.min.js");
+const FAVICON_SVG: &str = include_str!("../web/favicon.svg");
 
 /// The `__BASE_PATH__` placeholder in `index.html` that the `/` handler rewrites.
 const BASE_PATH_PLACEHOLDER: &str = "__BASE_PATH__";
@@ -89,6 +91,7 @@ pub fn router(store: Arc<DashboardStore>, pool: Pool, base_path: &str) -> Router
         .route(&prefixed("/app.js"), get(app_js))
         .route(&prefixed("/style.css"), get(style_css))
         .route(&prefixed("/echarts.min.js"), get(echarts_js))
+        .route(&prefixed("/favicon.svg"), get(favicon_svg))
         .route(&prefixed("/api/views"), get(get_views))
         .route(&prefixed("/api/series"), get(get_series))
         .route(&prefixed("/api/extent"), get(get_extent));
@@ -123,6 +126,10 @@ async fn style_css() -> impl IntoResponse {
 
 async fn echarts_js() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/javascript")], ECHARTS_JS)
+}
+
+async fn favicon_svg() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/svg+xml")], FAVICON_SVG)
 }
 
 // --- API ---
@@ -488,6 +495,18 @@ views:
         );
         let body = body_string(resp).await;
         assert!(body.len() > 100_000, "echarts bundle looks too small");
+    }
+
+    #[tokio::test]
+    async fn favicon_asset_is_served() {
+        let resp = get(app(""), "/favicon.svg").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/svg+xml"
+        );
+        let body = body_string(resp).await;
+        assert!(body.contains("<svg"), "body: {body}");
     }
 
     // --- base_path scoping ---
