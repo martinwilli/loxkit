@@ -295,16 +295,48 @@ struct RawControl {
 }
 
 /// A control's display details; we mine the format strings for a unit. An
-/// InfoOnlyAnalog carries a single format; a Meter has no format and instead
-/// carries actualFormat (its power sub) and totalFormat (its energy subs).
+/// InfoOnlyAnalog-style control carries a single `format` for its `value` state.
+/// A metered control (Meter, Wallbox2, ...) instead names one format per quantity
+/// as `<x>Format` -- actualFormat for its power sub, totalFormat for its energy
+/// subs. Those live in `extra` so a state finds its unit by that convention,
+/// rather than off a hardcoded field or the control type.
 #[derive(Deserialize)]
 struct RawDetails {
     #[serde(default)]
     format: Option<String>,
-    #[serde(rename = "actualFormat", default)]
-    actual_format: Option<String>,
-    #[serde(rename = "totalFormat", default)]
-    total_format: Option<String>,
+    /// Every other details key, verbatim. We only read the `<x>Format` ones (see
+    /// unit_for_sub), but the rest must deserialize as Value since a control mixes
+    /// in non-string details (a wallbox's min/max, its mode array).
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
+}
+
+impl RawDetails {
+    /// The display unit for a state sub, by Loxone's `<x>Format` convention: the
+    /// longest details key `<prefix>Format` whose prefix the sub name starts with
+    /// (so actualFormat units `actual`, and totalFormat units `total`, `totalDay`,
+    /// `totalNeg`, ...). The single `format` units only the primary `value` state.
+    /// Every other state carries no unit of its own, so none beats a wrong one.
+    fn unit_for_sub(&self, sub: &str) -> Option<String> {
+        if sub == "value"
+            && let Some(unit) = self.format.as_deref().and_then(unit_from_format)
+        {
+            return Some(unit);
+        }
+        self.extra
+            .iter()
+            .filter_map(|(key, value)| Some((key.strip_suffix("Format")?, value.as_str()?)))
+            .filter(|(prefix, _)| sub.starts_with(prefix))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .and_then(|(_, format)| unit_from_format(format))
+    }
+
+    /// Whether the control declares a cumulative energy total (a `totalFormat`).
+    /// Only then are its `total*` states counters (see index_control); a control
+    /// without one has none.
+    fn has_total_format(&self) -> bool {
+        self.extra.contains_key("totalFormat")
+    }
 }
 
 /// The `statistic` block on a control: the outputs it logs.
@@ -355,46 +387,27 @@ fn index_control(
         .and_then(|id| cats.get(id))
         .map(|c| c.name.clone())
         .or_else(|| inherited_cat.map(str::to_owned));
-    let is_meter = control.control_type == "Meter";
-    // A Meter's two units differ by sub (kW for power, kWh for energy), so one
-    // details.format can't cover both; it lists them separately as actualFormat
-    // and totalFormat. Precompute all three candidates and pick by sub below.
+    // Units and counter classification come from what the control declares about
+    // itself, never its type name. A control that lists an energy total format
+    // (totalFormat) has monotonic total* counters, and every state finds its unit
+    // by the <x>Format convention (RawDetails::unit_for_sub). This covers a Meter,
+    // a Wallbox2 and any future energy control with no control-type or sub-name list.
     let details = control.details.as_ref();
-    let format_unit = details
-        .and_then(|d| d.format.as_deref())
-        .and_then(unit_from_format);
-    let actual_unit = details
-        .and_then(|d| d.actual_format.as_deref())
-        .and_then(unit_from_format);
-    let total_unit = details
-        .and_then(|d| d.total_format.as_deref())
-        .and_then(unit_from_format);
+    let has_total_fmt = details.is_some_and(RawDetails::has_total_format);
 
     for (sub, value) in &control.states {
-        // Pick the unit by sub. On a Meter, an actual* sub is power (kW) from
-        // actualFormat and a total* sub (total, totalNeg, the resetting period
-        // totals) is energy (kWh) from totalFormat. Otherwise details.format
-        // describes the primary `value` state only; every other state (an analog
-        // sensor's `error` flag, a status/enum state) carries no unit of its own,
-        // so a wrong unit never beats none.
-        let entry_unit = if is_meter {
-            if sub.starts_with("actual") {
-                actual_unit.clone()
-            } else if sub.starts_with("total") {
-                total_unit.clone()
+        let entry_unit = details.and_then(|d| d.unit_for_sub(sub));
+        // A total* state on a control that declares an energy total is a monotonic
+        // counter, unless it names a reset period (totalDay/Week/Month/Year and
+        // their totalNeg* kin), which resets and so stays a gauge. A statistic
+        // visuType-2 output for the same uuid still overwrites this below, the
+        // authoritative gauge/counter signal whenever the operator logs the series.
+        let entry_agg_mode =
+            if has_total_fmt && sub.starts_with("total") && !resets_periodically(sub) {
+                AggMode::Counter
             } else {
-                None
-            }
-        } else if sub == "value" {
-            format_unit.clone()
-        } else {
-            None
-        };
-        let entry_agg_mode = if is_meter && matches!(sub.as_str(), "total" | "totalNeg") {
-            AggMode::Counter
-        } else {
-            AggMode::Gauge
-        };
+                AggMode::Gauge
+            };
         for uuid_str in state_uuids(value) {
             if let Ok(uuid) = uuid_str.parse::<LoxUuid>() {
                 out.insert(
@@ -406,12 +419,6 @@ fn index_control(
                         category: category.clone(),
                         sub: sub.clone(),
                         unit: entry_unit.clone(),
-                        // A Meter's total/totalNeg are monotonic counters,
-                        // classified here from the control type and sub with no
-                        // visuType to lean on; the resetting period totals stay
-                        // gauge for now. Any other plain state is a gauge too. A
-                        // statistic visuType-2 output for the same uuid still
-                        // overwrites this below and reclassifies it as a counter.
                         agg_mode: entry_agg_mode,
                     },
                 );
@@ -526,6 +533,16 @@ fn state_uuids(value: &Value) -> Vec<&str> {
         Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
     }
+}
+
+/// Whether a total-family sub name ends in a Loxone reset period, marking it a
+/// resetting period total (totalDay/Week/Month/Year, totalNegDay/...) rather than
+/// a monotonic lifetime counter. These reset, so they stay gauges. Expressing the
+/// split this way covers total, totalNeg and any future cumulative variant without
+/// a name list.
+fn resets_periodically(sub: &str) -> bool {
+    const RESET_PERIODS: [&str; 4] = ["Day", "Week", "Month", "Year"];
+    RESET_PERIODS.iter().any(|period| sub.ends_with(period))
 }
 
 /// Classify a statistic output's aggregation mode from its `visuType`.
@@ -748,9 +765,10 @@ mod tests {
         assert_eq!(second.sub, "Gesamtverbrauch");
     }
 
-    // A modern unidirectional Meter: no format and no statistic block, just raw
-    // states plus actualFormat/totalFormat. Exercises the by-sub unit pick and
-    // (in a later commit) the by-sub counter classification.
+    // A modern bidirectional Meter (the live "Netz"): no `format`, no statistic
+    // block, just raw states plus actualFormat/totalFormat. Exercises the by-sub
+    // unit pick and the period-suffix counter rule -- total and totalNeg are the
+    // lifetime counters, the resetting period totals (incl. the neg kin) gauges.
     const METER_FIXTURE: &str = r#"{
       "controls": {
         "deadbeef-7777-0000-0000000000000001": {
@@ -761,7 +779,8 @@ mod tests {
             "actual": "deadbeef-8888-0000-0000000000000001",
             "total": "deadbeef-8888-0000-0000000000000002",
             "totalNeg": "deadbeef-8888-0000-0000000000000003",
-            "totalDay": "deadbeef-8888-0000-0000000000000004"
+            "totalDay": "deadbeef-8888-0000-0000000000000004",
+            "totalNegDay": "deadbeef-8888-0000-0000000000000005"
           }
         }
       }
@@ -780,6 +799,7 @@ mod tests {
             "deadbeef-8888-0000-0000000000000002",
             "deadbeef-8888-0000-0000000000000003",
             "deadbeef-8888-0000-0000000000000004",
+            "deadbeef-8888-0000-0000000000000005",
         ] {
             assert_eq!(structure.resolve(&uuid(id)).unwrap().unit.as_deref(), Some("kWh"));
         }
@@ -799,9 +819,70 @@ mod tests {
         // The instantaneous actual power stays a gauge...
         let actual = uuid("deadbeef-8888-0000-0000000000000001");
         assert_eq!(structure.resolve(&actual).unwrap().agg_mode, AggMode::Gauge);
-        // ...as does the resetting per-day total.
+        // ...as does the resetting per-day total...
         let total_day = uuid("deadbeef-8888-0000-0000000000000004");
         assert_eq!(structure.resolve(&total_day).unwrap().agg_mode, AggMode::Gauge);
+        // ...and the resetting per-day export total: it is the period-suffix rule
+        // that keeps totalNegDay a gauge while totalNeg is a counter, not a list.
+        let total_neg_day = uuid("deadbeef-8888-0000-0000000000000005");
+        assert_eq!(structure.resolve(&total_neg_day).unwrap().agg_mode, AggMode::Gauge);
+    }
+
+    // A Wallbox2 (an EV charger): not a Meter by type, but it self-describes the
+    // same way -- an actualFormat/totalFormat pair over actual/total* states --
+    // alongside charger-only states (limit, mode) that are neither power nor
+    // energy. Pins that metered treatment keys off the declared formats, not a
+    // hardcoded control type. This is the series that used to log unitless gauges.
+    const WALLBOX_FIXTURE: &str = r#"{
+      "controls": {
+        "deadbeef-b111-0000-0000000000000001": {
+          "name": "Wallbox",
+          "type": "Wallbox2",
+          "details": {
+            "type": "unidirectional",
+            "actualFormat": "%.3fkW",
+            "totalFormat": "%.1fkWh",
+            "min": 0.0,
+            "max": 11.0
+          },
+          "states": {
+            "actual": "deadbeef-b222-0000-0000000000000001",
+            "total": "deadbeef-b222-0000-0000000000000002",
+            "totalDay": "deadbeef-b222-0000-0000000000000003",
+            "totalYear": "deadbeef-b222-0000-0000000000000004",
+            "limit": "deadbeef-b222-0000-0000000000000005",
+            "mode": "deadbeef-b222-0000-0000000000000006"
+          }
+        }
+      }
+    }"#;
+
+    #[test]
+    fn wallbox_is_metered_by_its_declared_formats_not_its_type() {
+        let structure = Structure::parse(WALLBOX_FIXTURE).unwrap();
+        // A Wallbox2 is not type "Meter", yet its actual/total* states get meter
+        // treatment purely from the actualFormat/totalFormat it declares.
+        let actual = structure.resolve(&uuid("deadbeef-b222-0000-0000000000000001")).unwrap();
+        assert_eq!(actual.control, "Wallbox2");
+        assert_eq!(actual.unit.as_deref(), Some("kW"));
+        assert_eq!(actual.agg_mode, AggMode::Gauge);
+        // The lifetime energy total is a kWh counter...
+        let total = structure.resolve(&uuid("deadbeef-b222-0000-0000000000000002")).unwrap();
+        assert_eq!(total.unit.as_deref(), Some("kWh"));
+        assert_eq!(total.agg_mode, AggMode::Counter);
+        // ...while the resetting per-day and per-year totals are kWh gauges.
+        for id in [
+            "deadbeef-b222-0000-0000000000000003",
+            "deadbeef-b222-0000-0000000000000004",
+        ] {
+            let entry = structure.resolve(&uuid(id)).unwrap();
+            assert_eq!(entry.unit.as_deref(), Some("kWh"));
+            assert_eq!(entry.agg_mode, AggMode::Gauge);
+        }
+        // A charger-only state that is neither power nor energy: no unit, gauge.
+        let limit = structure.resolve(&uuid("deadbeef-b222-0000-0000000000000005")).unwrap();
+        assert_eq!(limit.unit, None);
+        assert_eq!(limit.agg_mode, AggMode::Gauge);
     }
 
     #[test]
