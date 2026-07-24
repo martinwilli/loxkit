@@ -5,8 +5,13 @@ export CARGO_HOME := $(CURDIR)/debian/cargo_home
 # assumes root and drops --root-owner-group, capturing the builder's uid.
 export DEB_RULES_REQUIRES_ROOT := no
 
+# --without build-stamp: with the stamp in place dh short-circuits the entire
+# build sequence on any later `debian/rules binary`, which either packages a
+# stale target/release or fails in dh_install once cargo clean took it away.
+# cargo tracks source freshness itself, so let it decide and always run the
+# build; it is a no-op when nothing changed.
 %:
-	dh $@
+	dh $@ --without build-stamp
 
 # --workspace builds both members (loxtap and loxweb) from the virtual
 # workspace root, so dh_install finds both binaries under target/release.
