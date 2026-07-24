@@ -610,12 +610,24 @@
     });
 
     // y-axes: declared axes -> yAxis[]; none declared -> one implicit axis.
+    // Several axes on one side must be pushed outward by hand: ECharts stacks
+    // them at the same position otherwise, so their scales and labels collide.
+    // The grid margins below widen to match the outermost offset per side.
+    var AXIS_GAP = 48;
+    var leftAxisCount = 0;
+    var rightAxisCount = 0;
     var yAxis;
     if (panel.axes && panel.axes.length) {
       yAxis = panel.axes.map(function (ax, i) {
+        var position = ax.side || (i === 0 ? "left" : "right");
+        // The Nth axis on a side sits AXIS_GAP further out than the one before;
+        // the innermost keeps offset 0.
+        var offset =
+          (position === "left" ? leftAxisCount++ : rightAxisCount++) * AXIS_GAP;
         return {
           type: "value",
-          position: ax.side || (i === 0 ? "left" : "right"),
+          position: position,
+          offset: offset,
           // Config unit is the override; else fall back to the store unit of a
           // series on this axis, else leave it unlabeled.
           name: ax.unit || axisStoreUnit[i] || "",
@@ -732,7 +744,15 @@
       animation: false,
       backgroundColor: "transparent",
       textStyle: { color: chrome.ink2, fontFamily: "system-ui, -apple-system, sans-serif" },
-      grid: { left: 56, right: 56, top: 36, bottom: 44, containLabel: true },
+      // Widen the margins by one AXIS_GAP for each extra same-side axis, so the
+      // offset axes built above have room outside the plot.
+      grid: {
+        left: 56 + Math.max(0, leftAxisCount - 1) * AXIS_GAP,
+        right: 56 + Math.max(0, rightAxisCount - 1) * AXIS_GAP,
+        top: 36,
+        bottom: 44,
+        containLabel: true,
+      },
       legend: {
         data: legend,
         top: 4,
