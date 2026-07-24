@@ -18,8 +18,12 @@ export DEB_RULES_REQUIRES_ROOT := no
 override_dh_auto_build:
 	cargo build --release --locked --workspace
 
+# the test suite now reruns on every binary target, so keep the nocheck opt-out
+# dh_auto_test would have honored for us had we not overridden it.
 override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	cargo test --release --locked --workspace
+endif
 
 override_dh_auto_install:
 	# the binary is placed by debian/loxkit.install
