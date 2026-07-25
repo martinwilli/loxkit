@@ -6,25 +6,29 @@ license = "MIT"
 
 [dependencies]
 aes = "0.9"
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 async-trait = "0.1"
+# Held at postgres-protocol's version so the tree carries a single base64;
+# 0.23 only adds SIMD engines and consts we have no use for.
 base64 = "0.22"
 block-padding = "0.4"
 cbc = { version = "0.2", features = ["alloc", "block-padding"] }
-clap = { version = "4.6.1", features = ["derive"] }
-futures-util = "0.3.32"
+clap = { version = "4.6.4", features = ["derive"] }
+futures-util = "0.3.33"
 hmac = "0.13"
+# Stays in the rand_core 0.6 generation that rsa 0.9 takes in encrypt(), which
+# gets the very same OsRng that seeds the AES key; bump both together.
 rand = "0.8"
 refinery = { version = "0.9.2", features = ["tokio-postgres"] }
 rsa = "0.9"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha2 = "0.11"
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 tokio-postgres = { version = "0.7.18", features = ["with-uuid-1"] }
 tokio-tungstenite = "0.30"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-uuid = { version = "1.23.4", features = ["v4"] }
+uuid = { version = "1.24.0", features = ["v4"] }
 yaml_serde = "0.10.4"
