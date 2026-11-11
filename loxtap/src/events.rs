@@ -192,6 +192,19 @@ pub(crate) async fn handle_table(
             // here, ahead of both the label upsert and the write, so they never
             // become a series in the store.
             readings.retain(|r| !structure.is_ingest_filtered(&r.uuid));
+            // Never store a non-finite value either. A Miniserver forwards NaN
+            // for a value it failed to compute (a failed read upstream of a
+            // virtual input), and a single one turns the avg, max and integral
+            // of its whole bucket into NaN, in the raw tier and the rollups
+            // alike. Dropping it holds the last good value, like any other gap
+            // between on-change samples.
+            readings.retain(|r| {
+                let finite = r.value.is_finite();
+                if !finite {
+                    debug!(uuid = %r.uuid, value = r.value, "dropping non-finite reading");
+                }
+                finite
+            });
             if readings.is_empty() {
                 return;
             }
@@ -436,6 +449,36 @@ mod tests {
         assert!(metas
             .iter()
             .all(|m| m.sub != "actualOutdoorTemp" && m.sub != "averageOutdoorTemp"));
+    }
+
+    #[tokio::test]
+    async fn non_finite_readings_are_dropped_before_the_sink() {
+        let structure = Structure::parse(FIXTURE).unwrap();
+        let sink = RecordingSink::default();
+        let blob = value_blob(&[
+            ("deadbeef-2222-0000-0000000000000001", f64::NAN),
+            ("deadbeef-3333-0000-0000000000000001", f64::INFINITY),
+            ("00000000-0000-0000-0000000000000099", f64::NEG_INFINITY),
+            ("deadbeef-2222-0000-0000000000000001", 21.5),
+        ]);
+        handle_table(MessageType::ValueStates, &blob, &structure, &sink).await;
+
+        // Only the finite reading reaches the sink.
+        let readings = sink.readings.lock().unwrap();
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].value, 21.5);
+    }
+
+    #[tokio::test]
+    async fn an_all_non_finite_table_touches_no_sink() {
+        let structure = Structure::parse(FIXTURE).unwrap();
+        let sink = RecordingSink::default();
+        let blob = value_blob(&[("deadbeef-2222-0000-0000000000000001", f64::NAN)]);
+        handle_table(MessageType::ValueStates, &blob, &structure, &sink).await;
+
+        // Dropped ahead of the label upsert too, like the filtered mirrors.
+        assert!(sink.readings.lock().unwrap().is_empty());
+        assert!(sink.metas.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
