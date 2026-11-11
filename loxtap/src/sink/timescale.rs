@@ -7,7 +7,7 @@
 //! writes via `COPY … (BINARY)`, the clean bulk append for a narrow table;
 //! labels go through an idempotent `ON CONFLICT` upsert on `series_meta`.
 //!
-//! Two extra jobs ride the write path. Bit-identical repeats are dropped before
+//! Three extra jobs ride the write path. Bit-identical repeats are dropped before
 //! the COPY (see [`retain_changed`]): every reconnect re-dumps the current value
 //! of all series at a fresh receive time, and storing those repeats would bias
 //! time-unaware aggregates toward reconnect instants and bury the real
@@ -15,7 +15,10 @@
 //! handles the analytics. And `series_state` is upserted for every observed
 //! reading, changed or not, so it answers liveness and latest-value in O(1) on a
 //! fixed-size table; the dedup cache is seeded from it at startup so the first
-//! post-restart dump dedups too.
+//! post-restart dump dedups too. Finally, once an hour the TimescaleDB extensions
+//! are checked against their installed packages, as they are at connect: the
+//! sink updates a lagging toolkit it owns and warns about any other lag, since a
+//! package upgrade leaves the database on a version whose library may be gone.
 //!
 //! Reconnect is deliberately bounded. [`write`](TimescaleSink::write) runs
 //! inline on the websocket read path (the event loop awaits it), so a long or
@@ -27,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context as _;
 use futures_util::pin_mut;
@@ -37,7 +40,7 @@ use tokio_postgres::types::Type;
 use tokio_postgres::{Client, NoTls};
 use tracing::{info, warn};
 
-use super::Sink;
+use super::{extensions, Sink};
 use crate::config::TimescaleConfig;
 use crate::migrate;
 use crate::model::{LoxUuid, Reading, SeriesMeta};
@@ -47,6 +50,15 @@ use crate::model::{LoxUuid, Reading, SeriesMeta};
 /// the websocket read loop, so this must never approach the keepalive budget.
 const RECONNECT_ATTEMPTS: usize = 3;
 const RECONNECT_DELAY: Duration = Duration::from_millis(200);
+
+/// How often the write path re-checks the TimescaleDB extensions after the
+/// check at connect. The daemon restarts rarely, so a check at connect alone
+/// could leave a lagging toolkit unnoticed for weeks, while the hourly
+/// readings_1h refresh fails from the moment a package upgrade swaps the
+/// library. An hour keeps that outage well inside the refresh's 1-day
+/// start_offset, so the next run catches up on the missed buckets, and it
+/// rate-limits the warning about a lag the daemon cannot fix.
+const EXTENSION_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// The idempotent label upsert, batched: unnest the parallel arrays into rows,
 /// insert them, and update every label column on a uuid conflict. A rename is
@@ -95,6 +107,8 @@ pub struct TimescaleSink {
     /// dropped before the COPY. Seeded from `series_state` at startup so even
     /// the first post-restart dump dedups. Distinct from `labels`.
     dedup: Mutex<HashMap<LoxUuid, f64>>,
+    /// When the write path next checks the TimescaleDB extensions.
+    next_extension_check: Mutex<Instant>,
 }
 
 impl TimescaleSink {
@@ -164,10 +178,14 @@ impl TimescaleSink {
     /// Build the sink from an already-assembled Postgres config: connect, spawn
     /// the connection task, run the startup migrations once, and return it.
     ///
+    /// The extensions are checked ahead of the migrations, as a migration may
+    /// call into a lagging toolkit whose library a package upgrade removed.
+    ///
     /// The seam the integration test uses, parsing a DSN into a
     /// [`tokio_postgres::Config`] and handing it straight in.
     async fn from_pg_config(pg_config: tokio_postgres::Config) -> anyhow::Result<Self> {
         let mut client = Self::open(&pg_config).await?;
+        extensions::maintain(&client).await;
         migrate::run(&mut client).await.context("running startup migrations")?;
         let dedup = Self::seed_dedup(&client).await.context("seeding the dedup cache")?;
         Ok(Self {
@@ -175,6 +193,7 @@ impl TimescaleSink {
             client: AsyncMutex::new(client),
             labels: Mutex::new(HashMap::new()),
             dedup: Mutex::new(dedup),
+            next_extension_check: Mutex::new(Instant::now() + EXTENSION_CHECK_INTERVAL),
         })
     }
 
@@ -287,6 +306,22 @@ impl Sink for TimescaleSink {
         // Every observed reading advances series_state, even a fully-deduped
         // reconnect dump, so last_seen is true last-heard-from liveness.
         update_series_state(&client, batch).await?;
+
+        // The periodic extension check rides on the already-locked client: one
+        // catalog query, and on the rare update about a second. The std lock is
+        // never held across an await.
+        let due = {
+            let mut next = self.next_extension_check.lock().expect("extension check lock poisoned");
+            let now = Instant::now();
+            let due = now >= *next;
+            if due {
+                *next = now + EXTENSION_CHECK_INTERVAL;
+            }
+            due
+        };
+        if due {
+            extensions::maintain(&client).await;
+        }
         Ok(())
     }
 

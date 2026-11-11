@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::model::{Reading, SeriesMeta};
 
 pub mod debug;
+mod extensions;
 pub mod timescale;
 
 /// A destination for resolved readings and their labels.
