@@ -3,8 +3,9 @@
 loxtap stores its readings in TimescaleDB, and loxweb reads them back out of the
 same store. This guide installs and configures a suitable database on Ubuntu, up
 to the point where the daemon can connect. It stops there on purpose: loxtap owns
-its own schema and creates the tables on first run (see the closing note), so
-you only need a database with the right extensions present.
+its own schema and creates the extensions and tables on first run (see the
+closing note), so you only need the extension packages installed and an empty
+database.
 
 ## 1. Prerequisites and why
 
@@ -83,18 +84,21 @@ LAN, open the server up:
 loxtap connects as plain Postgres over the trusted LAN (no TLS). Do not expose the
 port to untrusted networks.
 
-## 5. Create the role, database, and extensions
+## 5. Create the role and database
 
 As the `postgres` superuser (`sudo -u postgres psql`), create loxtap's login role
-and its database, then enable the extensions inside it:
+and its database:
 
 ```sql
 CREATE ROLE loxtap LOGIN PASSWORD 'changeme';
 CREATE DATABASE loxtap OWNER loxtap;
-\c loxtap
-CREATE EXTENSION IF NOT EXISTS timescaledb;
-CREATE EXTENSION IF NOT EXISTS timescaledb_toolkit;
 ```
+
+Leave the extensions to loxtap. Both are marked trusted, so a role with `CREATE`
+on the database (as its owner has) may create them without being a superuser,
+and loxtap's migrations do exactly that on first run. The `loxtap` role then
+owns both extensions, and owning the toolkit is what lets the daemon keep it
+current after a package upgrade (see [Package upgrades](#package-upgrades)).
 
 Optionally add a least-privilege, read-only role for loxweb. Because loxtap
 creates its tables itself on first run, grant `SELECT` **after** that first run,
@@ -114,8 +118,10 @@ ALTER DEFAULT PRIVILEGES FOR ROLE loxtap IN SCHEMA public
 
 ## 6. Verify
 
-Connect to the database (`psql -h <db-host> -U loxtap loxtap`) and confirm both
-extensions are present and you got the Community edition:
+Once loxtap has run for the first time and applied its migrations (see
+[doc/LOXTAP-CONFIG.md](LOXTAP-CONFIG.md)), connect to the database
+(`psql -h <db-host> -U loxtap loxtap`) and confirm both extensions are present
+and you got the Community edition:
 
 ```console
 loxtap=# \dx
@@ -134,14 +140,44 @@ loxtap=# SHOW timescaledb.license;
 `SHOW timescaledb.license;` must print `timescale`, not `apache` — that is your
 proof the Community edition is loaded.
 
+## Package upgrades
+
+An apt upgrade of either extension package swaps its library, but each database
+stays at the old extension version until `ALTER EXTENSION … UPDATE` runs in it.
+The toolkit package keeps only its current library, so a lagging toolkit breaks
+right away, the continuous-aggregate refreshes included. The core package
+carries a few older libraries, so a lagging core lasts a while longer.
+
+loxtap checks both on startup and hourly after that:
+
+- **`timescaledb_toolkit`** — when the `loxtap` role owns it, loxtap updates it
+  itself, so it is current again within the hour. Otherwise loxtap logs a
+  warning.
+- **`timescaledb`** — loxtap only warns, hourly while it lags. Its update must
+  be the first command of a fresh session, and the daemons must reconnect to
+  load the new library:
+
+  ```sh
+  sudo -u postgres psql -X -d loxtap -c 'ALTER EXTENSION timescaledb UPDATE'
+  sudo systemctl restart loxtap loxweb
+  ```
+
+On a database where a superuser created the extensions (as older setups did),
+hand the toolkit over to the `loxtap` role once. PostgreSQL has no
+`ALTER EXTENSION … OWNER`, so as the `postgres` superuser, connected to the
+loxtap database, update the catalog directly:
+
+```sql
+UPDATE pg_extension SET extowner = 'loxtap'::regrole
+  WHERE extname = 'timescaledb_toolkit';
+```
+
 ## The loxtap daemon owns the schema
 
-Setup stops at "database plus extensions exist." loxtap applies its embedded
-migrations on first connect, creating the tables, the hypertable, the
-compression policy, and the continuous aggregates itself — there is no separate
-migration step to run. Pre-creating the two extensions here makes the daemon's
-own `CREATE EXTENSION IF NOT EXISTS` a no-op, so it succeeds even though the
-`loxtap` role is not a superuser.
+Setup stops at "the packages are installed and an empty database exists."
+loxtap applies its embedded migrations on first connect, creating the two
+extensions, the tables, the hypertable, the compression policy, and the
+continuous aggregates itself — there is no separate migration step to run.
 
 Next, point the daemon at this database: see
 [doc/LOXTAP-CONFIG.md](LOXTAP-CONFIG.md).
